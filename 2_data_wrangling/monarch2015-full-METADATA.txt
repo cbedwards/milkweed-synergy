@@ -1,0 +1,26 @@
+Cleaned data from Edwards' field work in 2015, putting monarch caterpillars on wild A. asclepiadis plants, and measuring their weight ~7 days later
+
+lgw: log of final caterpillar weight
+plantNum: identifier for individual plants (2 caterpillars put on each plant)
+lat1: latex measure at beginning of experiment
+lat2: latex measure at end of experiment
+date.out: day caterpillars were placed on plants
+weight: caterpillar weight at end of experiment
+date.in: day caterpillar was weighed. Note: this varied between 6 and 7 days later depending on weather
+tough: mean of the two toughness measures
+init.weigh: average caterpillar weight before being placed on the plants
+daysout: number days caterpillar was out. Note weather conditions caused this to be either 6 or 7 days
+c.X: cardenolide measure from HPLC for peak at time X at beginning of experiment
+c.X.fin: cardenolide measure from HPLC for peak at time X at the end of the experiment
+card.tot, card.tot.fin: sum of cardenolides at beginning or end of experiments. Not expected to be very informative, given variation in cardenolide efficacy.
+leaf.sample.weight: weight of sample used by COIL to measure C and N
+N2.Amp: COIL measure of N2
+perc.N: percent Nitrogen (dry weight) measured by COIL
+CO2.Amp: COIL measure of carbon
+perc.C: %C (dry weight) measured by COIL
+vert.transect: one of the two measures of trichome density (hairs crossing the vertical transect)
+c2n: carbon to nitrogen ratio
+sla: specific leaf area (units??)
+card.pca: PCA axis representing the peaks 17.4, 17.7, 18.4 at the beginning of the experiment (those peaks are correlated, and this captures 94% of the variation)
+2022-03-04 16:05:41
+from data-clean.R

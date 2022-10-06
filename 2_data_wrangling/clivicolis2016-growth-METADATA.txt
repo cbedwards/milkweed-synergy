@@ -1,0 +1,15 @@
+Cleaned data from Edwards' field work in 2016, putting ~5 clivicolis larvae on wild A. asclepiadis plants, and measuring their weight ~7 days later
+Entries for larvae that survived
+
+plantNum: identifier for individual plants (~5 larvae put on each plant)
+weight: larvae weight at end of experiment
+lgw: log of final larvae weight
+trich: mean trichome density across the two transects - this is the measure to be used to represent trichomes
+tough: mean of the two toughness measures
+lat: latex measure at end of experiment
+c.X: cardenolide measure from HPLC for peak at time X at beginning of experiment
+date.in: day larvae were collected and weighed. Note: this varied between 7 and 8 days later depending on weather
+dat.out: day larvae was placed out on plants
+daysout: number days larvae was out. Note weather conditions caused this to be either 7 or 8 days
+2022-03-04 16:05:41
+from data-clean.R

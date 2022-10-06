@@ -1,0 +1,2639 @@
+---
+title: "*Asclepias syraica* defense trait results"
+author: "Collin Edwards"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE)
+```
+# Introduction
+
+## Orientation
+
+Barring random forest fitting (see `rf-interactions-analysis.R`) and data cleaning (see `data-clean.R`), this script documents and carries out all analysis for this project, as well as most of the figure-making. Conceptual figures (Fig. 1 and 2) are generated in `figure-script-synergy-forms.R` and `figure-script-PRR.R`.
+
+To make the material more accessible, at the start of each section we describe the methods used and any complications in implementation. 
+
+Of particular note is the section on [Diagnostic plots with known interaction patterns](#diagnostics), which has code for simulating the predicted herbivore responses to user-defined synergies or antagonisms. In the main text we show the plots for six such interactions, but any user-supplied fitness function can easily be plotted with this code. See [this subsection](#diagexplor) for examples of the function in use.
+
+Note that the evaluation of interaction strength (implemented in `aov_interac` in the "Function definitions" section) is very time-consuming with the default grid.num of 50 (this creates 50x50 simulated plants per real plant observations, which is time-consuming to analyze). If you are not as interested in accuracy of those numbers and wanted to compile the full document more rapidly, consider changing the default to 10, which should drastically improve compile time.
+
+*L. clivicolis* was initially designated with 'clivicolis' and 'cliv' for data files. The main text and related tables and figures have been changed to use "beetle", as designation using the species name is a bit unusual. In places in the code, however, it was easier to leave the original designation.
+
+## Logistics:
+
+Data from Edwards' experiments is in `1_raw_data/`, and the script `3_scripts/data-clean.R` cleans and aggregates this data into workable data frames, saved as `.csv` files along with metadata files in `2_data_wrangling/`. For cleanliness,  I have only uploaded the cleaned/integrated data files, available in `2_data_wrangling/` (there were a range of separate files in `1_raw_data`, and documenting extraneous metadata for unused columns of these separate files became unwieldy). I include `3_scripts/data-clean.R` as a written log of the cleaning/integration steps taken.
+
+### key data files:
+
+- :`2_data_wrangling/monarch2015-full.csv` : Plant, larval growth and survival data from Edwards' 2015 experiments using monarch caterpillars.
+- :`2_data_wrangling/clivicolis2016-growth.csv` : Plant and larval growth data from Edwards' 2016 experiments using clivicolis. Only surviving larvae (and plants with at least one surviving larvae) are a part of this data sheet
+- :`2_data_wrangling/clivicolis2016-survival.csv` : Plant and survival data from Edwards' 2016 experiments on clivicolis. All larvae that were placed on plants (and thus all experimental plants that weren't removed due to field problems) are a part of this data sheet.
+
+# Setup
+
+For the sake of repeatability, we set the seed here, arbitrarily choosing 123. Commenting this code will mean that each time the script is re-run, random numbers will be different.
+
+```{r}
+set.seed(123)
+```
+
+
+```{r libraries, message=FALSE, warning=FALSE, cache=FALSE}
+library(lme4)
+library(dotwhisker)
+library(broom)
+library(viridis) #package for colors
+library(here) #package for handling file paths easily
+library(beepr) #package for making sound to let me know things are done. Not important for document compile, but useful for running time-consuming loops or tasks.
+library(MASS)
+library(openxlsx)
+library(car)
+library(tidyverse)
+library(sjPlot)
+library(sjmisc)
+library(pander)
+library(hierNet)
+library(lmerTest)
+library(mgcv)
+library(gridExtra)
+library(cowplot)
+library(ggpubr) #for smart ggplot multi-panels
+library(cowplot) #for smart ggplot multi-panels
+library(scales)
+library(lmtest)
+library(gridExtra);
+library(grid)
+library(ggplot2);
+```
+
+```{r random forest functions}
+source(here("3_scripts/rf-interactions-funs.R"))
+```
+
+
+```{r gg theme}
+theme.mine=theme(plot.title = element_text(face="bold", size=24),
+                 text=element_text(size=rel(6.5)))
+```
+
+
+## Function definitions
+
+```{r rf_class}
+## function for classifying Random Forest fits as synergies, antagonisms, or neither.
+## This implements the permutation testing described in the main test.
+## 
+## Individual steps in the function have commented diagnostic plots that help visualize each step. These don't affect the final results and aren't used in the ultimate figures, but you may find them useful if you're walking through the function line by line.
+
+## traits 1 and 2 are often labeled with t1 and t2. These are referring to our two different dimensions.
+
+rf_class = function(rf.obj, 
+                    t1.name, #name of trait 1 - first in dat.cur$ t1 x t2 naming convention
+                    t2.name, #name of trait 2
+                    resp.name, #name of response variable. E.g. "growth rate" or "survival"
+                    dat, #scaled data
+                    dat.unsc, #unscaled data
+                    gridnum = 10, #number of grid points in each dimension
+                    theme.use = theme.mine, #theme choices
+                    N = 999 #number of simulations to permute
+){
+  ## find squares of interest using RF data - that is, grid cells containing observations
+  h = diff(unique(rf.obj$grid$t1))[1]
+  temp=rf.obj$vals[,c("t1","t2")]
+  tab=unique(round(temp/h))
+  tab=tab*h
+  rownames(tab)=NULL
+  grid.use=rf.obj$grid
+  goodsqr=rep(FALSE,length(grid.use))
+  ## identify grid cells that contain real data points. 
+  for(i.grid in 1:nrow(grid.use)){
+    goodsqr[i.grid]=any(apply(tab,1, 
+                              function(x,sqr){sum((x-sqr)^2) < 10^-3},
+                              sqr=grid.use[i.grid,1:2] ))
+  }
+  rf.grid = rf.obj$grid
+  rf.grid$t1= rf.grid$t1 * diff(range(dat[ ,rf.obj$t1])) + min(dat[ ,rf.obj$t1])
+  rf.grid$t2= rf.grid$t2 * diff(range(dat[ ,rf.obj$t2])) + min(dat[ ,rf.obj$t2])
+  rf.grid = rf.grid[goodsqr,]
+  # ggplot(data = rf.grid, aes(x = t1, y = t2, fill = y.pred)) + 
+  # geom_tile()
+  
+  
+  ## Fit an additive model to RF predictions to determine the residuals
+  m.rflin = lm(y.pred ~ as.factor(t1) + as.factor(t2), data = rf.grid)
+  rf.lin = rf.grid[, c("t1","t2")]
+  rf.lin$y.pred = predict(m.rflin, newdata = rf.lin)
+  
+  # ggplot(data = rf.lin, aes(x = t1, y = t2, fill = y.pred)) + 
+  # geom_tile()
+  
+  rf.lin$resid = rf.grid$y.pred - rf.lin$y.pred
+  
+  # ggplot(data = rf.lin, aes(x = t1, y = t2, fill = resid)) + 
+  # geom_tile()+
+  # scale_fill_gradient2(low = muted("blue"),
+  # high = muted("red"))
+  
+  ## remove "lonely" squares from grid plotting for rf comparison
+  ## As a reminder: an additive model will perfectly predict any grid cell 
+  ## that has no other cells in its column or row, so looking at those residuals 
+  ## is meaningless.
+  ## We want to remove those cells, but doing so can result in NEW cells being "lonely".
+  ## The simplest (if somewhat janky) approach which we take here is to keep removing lonely cells until
+  ## we stop finding lonely cells.
+  dat.small=rf.lin
+  dim.new = nrow(dat.small)
+  do.smallification = TRUE
+  bad.t1 = bad.t2 = NULL
+  while(do.smallification){
+    dim.old = dim.new
+    t1.names=as.character(dat.small$t1)
+    t2.names=as.character(dat.small$t2)
+    bad.t1 = c(bad.t1, t1.names[t1.names %in% names(table(t1.names))[table(t1.names)==1]])
+    bad.t2 = c(bad.t2, t2.names[t2.names %in% names(table(t2.names))[table(t2.names)==1]])
+    # good.t1 = t1.names %in% names(table(t1.names))[table(t1.names)>1]
+    # good.t2 = t2.names %in% names(table(t2.names))[table(t2.names)>1]
+    dat.small = dat.small[!(t1.names %in% bad.t1) & !(t2.names %in% bad.t2),]
+    dim.new = nrow(dat.small)
+    if(dim.old == dim.new){do.smallification = FALSE}
+  }
+  dat.rf = rf.lin[!(as.character(rf.lin$t1) %in% bad.t1) &
+                    !(as.character(rf.lin$t2) %in% bad.t2),]
+  
+  # ggplot(data = dat.rf, aes(x = t1, y = t2, fill = resid)) + 
+  # geom_tile()+
+  # scale_fill_gradient2(low = muted("blue"),
+  # high = muted("red"))
+  dat.rf$signs = sign(dat.rf$resid)
+  # ggplot(data = dat.rf, aes(x = t1, y = t2, fill = signs)) + 
+  # geom_tile()+
+  # scale_fill_gradient2(low = muted("blue"),
+  # high = muted("red"))
+  
+  ## calculate possible breakpoints for separating out our data into the four quadrants used to calculate theta. The breakpoints are separate for each dimension.
+  t1.breaks = sort(unique(dat.rf$t1))[-1] - diff(sort(unique(dat.rf$t1)))/2
+  t2.breaks = sort(unique(dat.rf$t2))[-1] - diff(sort(unique(dat.rf$t2)))/2
+  
+  ## let's pre-allocate combinations of breakpoints for trait1 and trait2, since we're going to re-use this for our permutation tests.
+  tbreaks = expand.grid(t1.breaks, t2.breaks)
+  #label them with c1 and c2: "Critical point" for trait 1 and trait 2
+  names(tbreaks) = c("c1", "c2") 
+  #make data frame with breakpoints and empty column for thetas
+  theta.df = data.frame(tbreaks, theta=numeric(nrow(tbreaks)))
+  
+  for(i.row in 1:nrow(theta.df)){
+    c1 = theta.df$c1[i.row]
+    c2 = theta.df$c2[i.row]
+    theta = sum(dat.rf$signs[dat.rf$t1<c1 & dat.rf$t2< c2])+ #sum of Q1
+      sum(dat.rf$signs[dat.rf$t1 > c1 & dat.rf$t2 > c2]) - #sum of Q3
+      sum(dat.rf$signs[dat.rf$t1 < c1 & dat.rf$t2 > c2]) - #sum of Q2
+      sum(dat.rf$signs[dat.rf$t1 > c1 & dat.rf$t2 < c2]) #sum of Q4
+    ## scale theta by the number of squares:
+    theta.df$theta[i.row] = theta/nrow(dat.rf)
+  }
+  theta.df=theta.df[rev(order(abs(theta.df$theta))),]
+  theta.best = theta.df[1,]
+  
+  # ggplot(data = dat.rf, aes(x = t1, y = t2, fill = signs)) + 
+  # geom_tile()+
+  # scale_fill_gradient2(low = muted("blue"),
+  # high = muted("red"))+
+  # geom_vline(xintercept = theta.df$c1[1], size=2)+
+  # geom_hline(yintercept = theta.df$c2[1], size = 2)+
+  # ggtitle(paste("theta =", round(theta.df$theta[1],3)))
+  
+  
+  ## time to permute!
+  
+  theta.perm = numeric(N)
+  
+  for(i in 1:N){
+    rf.sim = rf.grid
+    #randomly permute random forest predictions
+    rf.sim$y.pred = sample(rf.sim$y.pred)
+    m.rflin = lm(y.pred ~ as.factor(t1) + as.factor(t2), data = rf.sim)
+    rf.lin = rf.sim[, c("t1","t2")]
+    rf.lin$y.pred = predict(m.rflin, newdata = rf.lin)
+    rf.lin$resid = rf.sim$y.pred - rf.lin$y.pred
+    
+    ## Note: re-use the "lonely" cell identification from above.
+    dat.sim = rf.lin[!(as.character(rf.lin$t1) %in% bad.t1) &
+                       !(as.character(rf.lin$t2) %in% bad.t2),]
+    dat.sim$signs = sign(dat.sim$resid)
+    
+    # ggplot(data = dat.sim, aes(x = t1, y = t2, fill = signs)) + 
+    #   geom_tile()+
+    #   scale_fill_gradient2(low = muted("blue"),
+    #                        high = muted("red"))
+    
+    ##note: we can re-use the tbreaks
+    theta.df = data.frame(tbreaks, theta=numeric(nrow(tbreaks)))
+    
+    for(i.row in 1:nrow(theta.df)){
+      c1 = theta.df$c1[i.row]
+      c2 = theta.df$c2[i.row]
+      theta = sum(dat.sim$signs[dat.sim$t1<c1 & dat.sim$t2< c2])+ #Q1
+        sum(dat.sim$signs[dat.sim$t1 > c1 & dat.sim$t2 > c2]) - #Q3
+        sum(dat.sim$signs[dat.sim$t1 < c1 & dat.sim$t2 > c2]) - #Q2
+        sum(dat.sim$signs[dat.sim$t1 > c1 & dat.sim$t2 < c2]) #Q4
+      ## scale theta by the number of squares:
+      theta.df$theta[i.row] = theta/nrow(dat.sim)
+    }
+    theta.df=theta.df[rev(order(abs(theta.df$theta))),]
+    theta.perm[i] = theta.df$theta[1]
+  }
+  theta.best$null.025 = quantile(theta.perm,probs = c(.025))
+  theta.best$null.975 = quantile(theta.perm,probs = c(.975))
+  ## designate interaction type
+  theta.best$int.class = "unclear"
+  if(theta.best$theta < quantile(theta.perm,probs = c(.025))){
+    theta.best$int.class = "synergy"
+  }
+  if(theta.best$theta > quantile(theta.perm,probs = c(.975))){
+    theta.best$int.class = "antagonism"
+  }
+  
+  
+  
+  ## Handling unscaling of traits, so our plots are on natural scales instead of unscaled
+  # dat.unsc is our original data; scaling involved subtracting the mean and then dividing by the standard devation
+  scale.t1=sd(dat.unsc[,rf.obj$t1], na.rm=T)
+  mn.t1 = mean(dat.unsc[,rf.obj$t1], na.rm=T)
+  scale.t2=sd(dat.unsc[,rf.obj$t2], na.rm=T)
+  mn.t2 = mean(dat.unsc[,rf.obj$t2], na.rm=T)
+  
+  rf.grid$t1unsc = rf.grid$t1*scale.t1+mn.t1
+  rf.grid$t2unsc = rf.grid$t2*scale.t2+mn.t2
+  
+  dat$t1unsc = dat[,rf.obj$t1]*scale.t1+mn.t1
+  dat$t2unsc = dat[,rf.obj$t2]*scale.t2+mn.t2
+  
+  dat.rf$t1unsc = dat.rf$t1*scale.t1+mn.t1
+  dat.rf$t2unsc = dat.rf$t2*scale.t2+mn.t2
+  
+  ## remember here: our calculations of the classification boundaries was also based on scaled trait values
+  theta.best$c1 = theta.best$c1*scale.t1+mn.t1
+  theta.best$c2 = theta.best$c2*scale.t2+mn.t2
+  
+  ## make plot of the random forest predictions
+  g.rf =
+    ggplot(rf.grid, aes(x=t1unsc, y=t2unsc)) +
+    geom_tile(aes(fill=y.pred))+
+    labs(fill = resp.name) +
+    geom_point(data = dat, aes(x=t1unsc, y=t2unsc), color="white",size=3) +
+    geom_point(data = dat, aes(x=t1unsc, y=t2unsc), color="black",size=3, shape =1)+
+    ggtitle("Random Forest predictions") +
+    theme.use+
+    theme(legend.text = element_text(size=16),
+          legend.key.width = unit(1,'cm'),
+          legend.key.height = unit(2, "cm"),
+          legend.title = element_text(size=22),
+          axis.title = element_text(size = 28))+
+    xlab(t1.name)+
+    ylab(t2.name)
+  
+  
+  #make plot of the residuals and quadrants
+  g.class =
+    ggplot(data = dat.rf, aes(x = t1unsc, y = t2unsc, fill = resid)) + 
+    geom_tile()+
+    scale_fill_gradient2(name = paste0("non-additivity\n of ", resp.name),
+                         low = muted("blue"),
+                         high = muted("red"))+
+    geom_vline(xintercept = theta.best$c1, size=2)+
+    geom_hline(yintercept = theta.best$c2, size = 2)+
+    # ggtitle(paste0("classification: ",theta.best$int.class,"\n",
+    #                expression(theta), " = ", 
+    #                round(theta.best$theta,3), ",  ",
+    #                "null 95%: ",
+    #                round(quantile(theta.perm,probs = c(.025)),3)," -- ",
+    #                round(quantile(theta.perm,probs = c(.975)),3)
+    # )
+    ggtitle(bquote(atop(classification: ~ .(theta.best$int.class),
+                        theta == .(paste0(round(theta.best$theta,3),",")) ~ "  null 95%: " ~ .(paste0(round(quantile(theta.perm,probs = c(.025)),3), " -- ", round(quantile(theta.perm,probs = c(.975)),3)))))
+    )+
+    theme.use+
+    theme(legend.text = element_text(size=16),
+          legend.key.width = unit(1,'cm'),
+          legend.key.height = unit(2, "cm"),
+          legend.title = element_text(size=22),
+          axis.title = element_text(size = 28))+
+    xlab(t1.name)+
+    ylab(t2.name)
+  return(list(g.rf = g.rf, 
+              g.class = g.class, 
+              theta.best = theta.best,
+              theta.perm = theta.perm))
+}
+
+
+
+
+
+```
+
+
+
+```{r seq_thru}
+seq_thru = function(vec, len){
+  ## function to streamline making sequences from minimum to maximum of a given vector, with sequence length len
+  seq(min(vec, na.rm = T), max(vec, na.rm = T), length=len) 
+}
+
+```
+
+
+```{r regression_biplots}
+## figure-making material for showing the results of regression
+
+#making theme 
+theme.regbiplot = theme(plot.title = element_text(face="bold", size=16),
+                        text=element_text(size=rel(4)),
+                        legend.title = element_text(size=14),
+                        legend.text = element_text(size=14),
+                        axis.text = element_text(size=14),
+                        legend.key.height = unit(.5, "cm"),
+                        legend.title.align=0.5
+)
+
+
+regression_biplots = function(dat.sc, #scaled data
+                              dat.unsc, #unscaled data (original scaling)
+                              mod, #fitted model
+                              title.cur, #current title
+                              trait1, #string for trait1 that identifies the column in the data
+                              trait1.name, #pretty name for trait1, for plot labels
+                              trait2,
+                              trait2.name,
+                              # realval, # appears to be vestigial, trying removing it
+                              response.name, #name for the response, used in plotting
+                              response.name.dat, #optionally, can also give name for the response COLOR in addition to fill. Generally leave ""
+                              dim.len=50){
+  
+  # dat.unsc$realval = realval
+  dat.test = expand.grid(trait1 = seq_thru(dat.sc[,trait1], dim.len),
+                         trait2 = seq_thru(dat.sc[, trait2], dim.len))
+  names(dat.test) = c(trait1, trait2)
+  #use new levels for the random effects of the plot.
+  dat.test$plantNum = as.character(-1*(1:nrow(dat.test)))
+  dat.test$date.out="new"
+  
+  response = predict(mod, newdata = dat.test, type="response", 
+                     exclude='s(date.out, bs = "re") + s(plantNum, bs = "re")'
+  )
+  
+  ## range for plotting
+  plot.unsc = expand.grid(trait1 = seq_thru(dat.unsc[,trait1], dim.len),
+                          trait2 = seq_thru(dat.unsc[, trait2], dim.len))
+  
+  
+  
+  fig = ggplot(data=plot.unsc, aes(x=trait1, y=trait2))+
+    geom_tile(aes(fill = response))+
+    geom_point(data = dat.unsc[!is.na(dat.unsc[,trait1]) &
+                                 !is.na(dat.unsc[,trait2]),],
+               # aes(col = (!is.na(grate))),
+               aes(x = !!sym(trait1), y = !!sym(trait2)),
+               size=2, col='white')+
+    geom_point(data = dat.unsc[!is.na(dat.unsc[,trait1]) &
+                                 !is.na(dat.unsc[,trait2]),],
+               # aes(col = (!is.na(grate))),
+               aes(x = !!sym(trait1), y = !!sym(trait2)),
+               size=2, stroke = 1,
+               pch=21, col='black')+
+    ggtitle(title.cur)+
+    xlab(trait1.name)+
+    ylab(trait2.name)+
+    labs(fill = response.name,
+         col = response.name.dat)+
+    theme.regbiplot
+  return(fig)
+}
+```
+
+
+```{r fig_starter}
+## Function for making figs with metadata.
+## I have been transitioning to using ggplot, which allows more elegant saving options. This figure is currently used just for the correlation plots.
+## 
+fig_starter=function(filename, #name of figure file to save as WITHOUT SUFFIX
+                     description, #vector of strings, each will be put in its own line of meta file
+                     ##  Note: generating file is defined in the function, date and time is automatically added.
+                     ##default figure info:
+                     width=12,
+                     height=8,
+                     units="in",
+                     res=300,
+                     figfold="5_figs",
+                     scriptname="analysis_main.Rmd"
+){
+  #function to automate making a jpeg figure (can change code here to make png)
+  #and also add meta text
+  #NOTE: still have to use dev.off() at the end of plot-making
+  
+  ## save meta file
+  cat(c(description,
+        "",##easy way to add an extra line to separate description for basic data.
+        paste("from",scriptname),
+        as.character(Sys.time())),
+      sep="\n",
+      file=here(figfold, paste(filename,"_meta.txt", sep=""))
+  )
+  
+  ## open jpeg device
+  jpeg(file=here(figfold,paste(filename,".jpg", sep="")),
+       width=width, 
+       height=height, 
+       units=units, 
+       res=res)
+}
+## Example usage:
+# fig_starter(filename="testfig", description=c("This figure was made as an example.","We can add endless lines of description."))
+# plot(1:10,1:10, pch=1:10)
+# dev.off()
+## Note: in this case the example will not work for you unless you give it the correct location for "figfold" - the relative file path to the folder for your figures.
+```
+
+```{r gfig_saver}
+# function for saving ggplot figures and metadata. As fig_starter (which is for base graphics), except that saving ggfigures is inherently cleaner, as you are not feeding commands to an open graphics device
+
+gfig_saver=function(gfig, #object to be saved
+                    filename, #name of figure file to save as WITHOUT SUFFIX
+                    description, #vector of strings, each will be put in its own line of meta file
+                    ##  Note: generating file is defined in the function, date and time is automatically added.
+                    ##default figure info:
+                    width=12,
+                    height=8,
+                    res=300,
+                    units="in",
+                    figfold="5_figs",
+                    scriptname="analysis_main.Rmd"
+){
+  ## save meta file
+  cat(c(description,
+        "",##easy way to add an extra line to separate description for basic data.
+        paste("from",scriptname),
+        as.character(Sys.time())),
+      sep="\n",
+      file=here(figfold, paste(filename,"_meta.txt", sep=""))
+  )
+  ggsave(filename=here(figfold, paste(filename,".tiff", sep="")),
+         plot=gfig,
+         device="tiff",
+         dpi=res,
+         width=width, height=height, units=units
+  )
+}
+```
+
+```{r pairs functions}
+## functions for use in pairs()
+## used in making correlation plots
+panel.hist <- function(x, ...){
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE, breaks=20)
+  breaks <- h$breaks; nB <- length(breaks)
+  y <- h$counts; y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col = "cyan", ...)
+}
+panel.cor <- function(x, y,
+                      digits = 2,
+                      prefix = "",
+                      # cex.cor,
+                      ...){
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- abs(cor(x, y, use="complete.obs"))
+  rsigned=cor(x, y, use="complete.obs")
+  p = cor.test(x, y, use="complate.obs")$p.value
+  txt <- format(c(rsigned, 0.123456789), digits = digits)[1]
+  txt <- paste0(prefix, txt)
+  cex.cor <- 0.8/strwidth(txt)
+  col="darkgrey"
+  if(p<.05){col="blue"}
+  text(0.5, 0.5, txt, cex = 2.5, col=col)
+  text(.5,.1, paste("p <",signif(p,2)),cex=1.8)
+}
+
+```
+
+```{r aov_interac}
+## function for calculating the relative importance of an interaction term in explaining variance, as well as the overall `effect size`  (PRR) of the model including the two focal traits and their interactions.
+## 
+## This relies on the kernel density estimator functions in rf-interactions-funs.R
+
+aov_interac = function(dat.pl, #data frame with one entry per plant, excluding rows with NAs
+                       traits, # vector with the two traits of interest
+                       modfit, #fitted model
+                       maineff, #list of all main effects, for weights calculation
+                       inv.link = function(x){x}, #default is identity link. For survival, this should be plogit
+                       grid.num=50){ #dimensions to plot on grid. We find that above grid.num = 50, we see minimal changes in results (and high computational costs)
+  trait1 = traits[1]
+  trait2 = traits[2]
+  
+  dat.grid=NULL
+  #make grid of traits to test
+  trait.grid=expand.grid(seq(min(dat.pl[,trait1], na.rm=T),
+                             max(dat.pl[,trait1], na.rm=T),
+                             length=grid.num),
+                         seq(min(dat.pl[,trait2], na.rm=T),
+                             max(dat.pl[,trait2], na.rm=T),
+                             length=grid.num)
+  )
+  
+  names(trait.grid) = c("trait1", "trait2")
+  
+  ## make predictions along the grid of traits, for calculating %PRV
+  # extract coefficients
+  coefs.fit = modfit$coefficients[1:4]
+  # predict y from coefficients
+  ypred = coefs.fit[1] + 
+    coefs.fit[2]*trait.grid$trait1 +
+    coefs.fit[3]*trait.grid$trait2 +
+    coefs.fit[4]*trait.grid$trait1*trait.grid$trait2
+  # y is on the link scale. We want that!
+  
+  
+  ## Now make predictions for the plants themselves, for calculating PRR. we'll call this yhat
+  yhat = coefs.fit[1] + 
+    coefs.fit[2]*dat.pl[,trait1] +
+    coefs.fit[3]*dat.pl[,trait2] +
+    coefs.fit[4]*dat.pl[,trait1]*dat.pl[,trait2]
+  yhat = yhat[[1]]
+  #if we get NAs from missing trait values, remove them
+  yhat = na.omit(yhat)
+  #for this we want y to be on the RESPONSE scale.
+  yhat = inv.link(yhat)
+  
+  ## calculate weights using kernel density estimation
+  ## remember, dat.pl is each plant, includes factors etc
+  ## select only the two traits we're varying.
+  x.pl = dat.pl[, c(trait1, trait2)]
+  x.pl = na.omit(x.pl)
+  ## start by scaling so that dimensions are comparable
+  x.sc=apply(x.pl,2, function(x){(x-min(x))/diff(range(x))})
+  #calculate optimal bandwidth parameter
+  opt=optimise(interval=c(.0001, 1), f=kdem.cv_wrapper, Y=x.sc)
+  
+  ## now calculate weights
+  ## First, make a version of dat.grid that's equivalent to x.sc
+  x.grid.sc = apply(trait.grid,2, function(x){(x-min(x))/diff(range(x))})
+  wts = mk_sample(x.sc, x.grid.sc, opt=opt)
+  
+  ################################
+  ## quick check: visualize
+  plot.grid = data.frame(trait.grid, resp = (ypred))
+  names(plot.grid)[1:2] = c(trait1, trait2)
+  # plot.grid = dat.grid %>% 
+  #   group_by_(trait1, trait2) %>% 
+  #   summarize(resp = mean(resp)) %>% 
+  #   as.data.frame()
+  plot.grid[,trait1]=as.factor(plot.grid[,trait1])
+  plot.grid[,trait2]=as.factor(plot.grid[,trait2])
+  # g.cur = ggplot(plot.grid) +
+  # geom_tile(aes(x = lat, y = c10.2, fill=growth))
+  # ggsave(here(),
+  # g.cur)
+  # ANOVA with no interaction
+  anov.dat = plot.grid
+  form = (paste0("resp ~ ", trait1, " + ", trait2))
+  mod = lm(formula(form), data=anov.dat)
+  out.cur = Anova(mod, type = 3, singular.ok=TRUE, wts = wts)
+  SS.int = tail(out.cur$`Sum Sq`,1)
+  SS.tot = sum(out.cur$`Sum Sq`[-1])
+  
+  
+  pred.max = max(yhat)
+  pred.min = min(yhat)
+  
+  res = list(rel.expl = SS.int/SS.tot, range= c(pred.min, pred.max))
+  return(res)
+}
+```
+
+## Data
+
+### Reading in
+
+We have three datasets -- all monarch data, the beetle (clivicolis) data for growth (which excludes plants we had no survivors on), and beetle (clivicolis) survival data.
+
+```{r}
+dat.mon15 = read.csv(here("2_data_wrangling","monarch2015-full.csv"))
+
+dat.cliv16.g = read.csv(here("2_data_wrangling","clivicolis2016-growth.csv"))
+
+dat.cliv16.s = read.csv(here("2_data_wrangling","clivicolis2016-survival.csv"))
+```
+
+### LMA and nitrogen
+
+To simplify interpretation, we want all traits to be measured as "defense" (e.g. *a priori* we expect increased values to be bad for herbivores). The two that need changing are SLA (specific leaf area), which we convert to LMA (leaf mass per area) [labeled `inv.sla` in the code], and % nitrogen, which we convert to 'non-nitrogen', or 100 - percent nitrogen [labeled `perc.notN` in the code].
+
+```{r}
+dat.mon15$perc.notN=100-dat.mon15$perc.N
+dat.mon15$inv.sla = 1/dat.mon15$sla
+```
+
+### trichome count to density
+
+
+Trichomes in the dataset are measured as the average transect count, and we want that in count per mm of transect. Transects are the diameter of a 31.67 square mm hole punch. $A = \pi r^2$, so $d = 2(\frac{A}{\pi})^{1/2}$ where d is the diameter.
+
+```{r}
+diam = 2*sqrt(31.67/pi)
+
+dat.mon15$trich = dat.mon15$trich/diam
+dat.cliv16.g$trich = dat.cliv16.g$trich/diam
+dat.cliv16.s$trich = dat.cliv16.s$trich/diam
+```
+
+### Latex to milligrams
+
+Our latex measures were in grams wet mass, and generally ranged from 0.0005 to 0.01. For aesthetic reasons, we change to mg.
+
+```{r}
+dat.mon15$lat1 = dat.mon15$lat1*1000
+dat.cliv16.g$lat = dat.cliv16.g$lat*1000
+dat.cliv16.s$lat = dat.cliv16.s$lat*1000
+```
+
+
+### Scale predictors.
+
+As stated in the main text, we rescale traits to have mean 0 and standard deviation 1. Among other things, this is necessary to account for the dramatically different units / scales across traits.
+
+
+```{r}
+## loop approach, monarchs 
+datsc.mon15 = dat.mon15
+
+
+for(cur.name in colnames(dat.mon15)[-which(colnames(dat.mon15) %in% c("lgw", "plantNum", "date.out", "date.in", "daysout"))]){
+  datsc.mon15[, cur.name] = (datsc.mon15[ , cur.name]-mean(datsc.mon15[ , cur.name], na.rm=TRUE)) / 
+    sd(datsc.mon15[ , cur.name], na.rm=TRUE)
+}
+
+
+## loop approach, beetle growth
+datsc.cliv16.g = dat.cliv16.g
+for(cur.name in colnames(dat.cliv16.g)[-which(colnames(dat.cliv16.g) %in% c("lgw", "weight", "plantNum", "date.out", "date.in", "daysout"))]){
+  datsc.cliv16.g[, cur.name] = (datsc.cliv16.g[ , cur.name] -mean(datsc.cliv16.g[ , cur.name], na.rm=TRUE)) / 
+    sd(datsc.cliv16.g[ , cur.name], na.rm=TRUE)
+}
+
+## loop approach, beetle survival
+datsc.cliv16.s = dat.cliv16.s
+for(cur.name in colnames(dat.cliv16.s)[-which(colnames(dat.cliv16.s) %in% c("lgw", "weight", "plantNum", "date.out", "date.in", "daysout", "surv"))]){
+  datsc.cliv16.s[, cur.name] = (datsc.cliv16.s[ , cur.name] -mean(datsc.cliv16.s[ , cur.name], na.rm=TRUE)) / 
+    sd(datsc.cliv16.s[ , cur.name], na.rm=TRUE)
+}
+```
+
+
+```{r}
+#ensure our blocking factors are treated as factors.
+datsc.mon15$plantNum = as.factor(datsc.mon15$plantNum)
+datsc.mon15$date.out = as.factor(datsc.mon15$date.out)
+
+datsc.cliv16.s$date.out = as.factor(datsc.cliv16.s$date.out)
+datsc.cliv16.g$date.out = as.factor(datsc.cliv16.g$date.out)
+datsc.cliv16.s$plantNum = as.factor(datsc.cliv16.s$plantNum)
+datsc.cliv16.g$plantNum = as.factor(datsc.cliv16.g$plantNum)
+## adding a survival variable.
+datsc.mon15$surv = !is.na(datsc.mon15$lgw)
+```
+
+# Analysis
+
+## Trait correlations{.tabset}
+
+Here we look at the cleaned data, identify suites of covarying cardenolides, and make supplemental figures of correlations.
+
+### Monarchs{.tabset}
+
+Using `mon15` as the name for this data
+
+#### Correlation plots
+
+```{r}
+## make data frame to plot - use only lgw for weight
+dat.pairplot = dat.mon15 %>%
+  select(-plantNum, -daysout, -date.out, -date.in, -weight, -leaf.sample.weight, -init.weight, -card.tot, -card.tot.fin, -N2.Amp, -CO2.Amp, -perc.N, -sla)
+
+dat.phys= dat.pairplot %>%
+  select(-starts_with("c."))
+
+## growth
+fig_starter("corrplot-mon15-phys",
+            description=c("pairwise correlation plots of monarch growth in 2015, only non-cardenolide traits"), 
+            width=12, height=12)  
+pairs(dat.phys,
+      lower.panel=panel.cor,
+      diag.panel=panel.hist,
+      cex=.8)
+invisible(dev.off())
+
+dat.card= dat.pairplot %>%
+  select(starts_with("c."))
+
+## survival
+fig_starter("corrplot-mon15-card",
+            description=c("pairwise correlation plots of monarch 2015 field season, only cardenolides",
+                          "Note that the suffix .fin means it was a measure from the end of the experiment",
+                          "Also note that c.pca is the first axis of a PCA of c.17.5, c.17.7, and c.18.4, which captures 94% of the variation of those."), 
+            width=12, height=12)  
+pairs(dat.card,
+      lower.panel=panel.cor,
+      diag.panel=panel.hist,
+      cex=.8)
+invisible(dev.off())
+
+dat.analysis= dat.pairplot %>%
+  select(-ends_with(".fin"), -lat2, -c.17.7, -c.17.4, -c.18.4)
+
+fig_starter("corrplot-mon15-analysis",
+            description=c("pairwise correlation plots of monarch 2015 field season, only terms used in the analysis",
+                          "Note that c.pca is the first axis of a PCA of c.17.5, c.17.7, and c.18.4, which captures 94% of the variation of those."), 
+            width=12, height=12)  
+pairs(dat.analysis,
+      lower.panel=panel.cor,
+      diag.panel=panel.hist,
+      cex=.8)
+invisible(dev.off())
+
+```
+
+We have many measured traits. We present three combinations of pairwise comparisons. First, all non-cardenolide traits:
+
+![](../5_figs/corrplot-mon15-phys.jpg)
+
+
+Second, all cardenolide traits. Note this includes before and after (after end in .fin), as well as c.17.5, c.17.7, and c.18.4 in addition to c.pca which we use to represent them in the analysis.
+
+![](../5_figs/corrplot-mon15-card.jpg)
+
+Finally, here are the traits used in the analysis: cardenolides at the beginning of the experiment, latex at the beginning of the experiment, and the pca replacing the three correlated cardenolides.
+
+![](../5_figs/corrplot-mon15-analysis.jpg)
+
+### Beetle{.tabset}
+
+Using `cliv16` for naming convention, `.g` for growth and `.s` for survival. Here we can look at growth.
+
+#### Correlation plots
+
+```{r}
+## make data frame to plot - use only lgw for weight
+dat.pairplot = dat.cliv16.g %>%
+  select(-plantNum, -daysout, -date.out, -date.in, -weight)
+dat.pairplot=dat.pairplot[order(names(dat.pairplot))]
+
+## growth
+fig_starter("corrplot-cliv16-growth",
+            description=c("pairwise correlation plots of beetle growth in 2016"), 
+            width=12, height=12)  
+pairs(dat.pairplot,
+      lower.panel=panel.cor,
+      diag.panel=panel.hist,
+      cex=1.2)
+invisible(dev.off())
+
+dat.pairplot = dat.cliv16.s %>%
+  select(-plantNum, -daysout, -date.out, -date.in)
+dat.pairplot=dat.pairplot[order(names(dat.pairplot))]
+
+## growth
+fig_starter("corrplot-cliv16-surv",
+            description=c("pairwise correlation plots of beetle survival data in 2016"), 
+            width=12, height=12)  
+pairs(dat.pairplot,
+      lower.panel=panel.cor,
+      diag.panel=panel.hist,
+      cex=.8)
+invisible(dev.off())
+```
+
+Here we have two separate sets of data, with `r length(unique(dat.cliv16.g$plantNum))` plants for which we have herbivore weight, and `r length(unique(dat.cliv16.s$plantNum))` for which we have herbivore survival status.
+
+Weight measures:
+
+![](../5_figs/corrplot-cliv16-growth.jpg)
+
+
+Survival measures:
+
+![](../5_figs/corrplot-cliv16-surv.jpg)
+
+### Figure S1: final correlation plots
+
+Here we generate the plots for Figure S1. For Beetles, we choose to use the larger data set (all plants we measured, rather than just those for which we had surviving larvae), as this provides a more complete picture of plant trait expression.
+
+
+#### Monarch
+
+```{r}
+dat.pairplot = dat.mon15 %>%
+  select(lat1, inv.sla, tough, trich, c.10.5, c.18.6, c.pca, perc.notN, c2n, perc.C) %>% 
+  relocate(lat1, inv.sla, tough, trich, c.10.5, c.18.6, c.pca, perc.notN, c2n, perc.C)
+# dat.pairplot=dat.pairplot[order(names(dat.pairplot))]
+
+fig_starter("finals/corrplot-fin-Mon15",
+            description=c("pairwise correlation plots of monarch data in 2015"), 
+            width=14, height=14)
+names(dat.pairplot)
+pairs(dat.pairplot,
+      lower.panel=panel.cor,
+      diag.panel=panel.hist,
+      cex=1,
+      cex.labels = 1.8,
+      cex.axis = 1.8,
+      labels=c("latex",
+               "LMA",
+               "leaf\ntoughness",
+               "trichome\ndensity",
+               "cardenolide\n10.5",
+               "cardenolide\n18.6",
+               "cardenolide\nsuite 2015",
+               "non-nitrogen",
+               "C:N",
+               "% carbon")
+)
+invisible(dev.off())
+```
+
+
+#### Beetles
+
+```{r}
+dat.pairplot = dat.cliv16.s %>%
+  select(lat, tough, trich, c8.4, c10.2, c.pca) %>% 
+  relocate(lat, tough, trich, c8.4, c10.2, c.pca) 
+
+
+fig_starter("finals/corrplot-fin-Cliv16S",
+            description=c("pairwise correlation plots of beetle survival data in 2016"), 
+            width=16, height=16)
+pairs(dat.pairplot,
+      lower.panel=panel.cor,
+      diag.panel=panel.hist,
+      cex=1,
+      cex.labels = 3,
+      cex.axis = 2,
+      labels=c("latex",
+               "leaf\ntoughness",
+               "trichome\ndensity",
+               "cardenolide\n8.5",
+               "cardenolide\n10.2",
+               "\ncardenolide\nsuite 2016")
+)
+invisible(dev.off())
+
+```
+
+
+## Regression{.tabset}
+
+For simplicity, code in Monarch Growth has detailed commenting, the other sections have less. Aside from a few differences (trait names between monarch and beetle, regression type between growth and survival, file names) the code in Monarchs and Beetles subsections are effectively identical.
+
+```{r}
+## header format for  excel results sheets
+hs1 <- createStyle(fgFill = "#4F81BD", halign = "CENTER", textDecoration = "Bold",
+                   border = "Bottom", fontColour = "white")
+#make workbook
+wb = createWorkbook()
+
+res.tot = NULL #for storing all results in a single flat data frame, using a generic "test statistic" column
+
+#for coloring the switch points in the plots
+col.switch = "#d44a1e"
+```
+
+Note that the approach we're taking to build our results using loops generates warnings relating to row names, which aren't relevent for this work (we aren't using the row names). We have turned off warnings for these chunks to avoid the irrelevant warnings ( `warning = FALSE` in the chunk header). (we do not get any other warning messages when running this code).
+
+### Monarchs{.tabset}
+
+#### Growth
+
+
+```{r, warning = FALSE}
+#quick make sure these are factors
+datsc.mon15$plantNum = as.factor(datsc.mon15$plantNum)
+datsc.mon15$date.out = as.factor(datsc.mon15$date.out)
+
+## do a bit of data prep and filtering
+dat.pl = datsc.mon15 %>% 
+  mutate(plantNum = as.character(plantNum)) %>% 
+  filter(!is.na(lgw)) %>% #skip any plants that had no survivors
+  group_by(plantNum) %>%
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  select(-weight, -surv, -lgw)
+
+
+## set up automated formula-making
+maineff = c("inv.sla", "c.10.5", "c.18.6", "perc.notN", "perc.C", "lat1", "trich", "tough", "c.pca")
+
+## pretty trait names, in teh same order
+maineff.names = c("LMA", "cardenolide 10.5",
+                  "cardenolide 18.6", "non nitrogen (%)", "carbon (%)", "latex",
+                  "trichome density", "leaf toughness", "cardenolide suite 2015")
+
+## storing for later
+names.map = data.frame(basic = maineff, pretty = maineff.names)
+
+###Loop through all single pairwise interactions.
+# first, define all such interactions programmatically
+# using maineff
+
+#using outer because it's awesome
+int = outer(maineff, 
+            maineff, 
+            FUN = function(x, y){paste0(x,":",y)})
+# now select just the lower triangle (so we only get each interaction once)
+int.use = int[lower.tri(int)]
+
+## repeat, but for the names. Use - as separator here
+int.name = outer(maineff.names,
+                 maineff.names,
+                 FUN = function(x,y){paste0(x,"-",y)})
+int.name.use = int.name[lower.tri(int.name)]
+
+store.df = NULL
+
+## ugh. it looks like R swaps the order of interaction labels. Going to have to use grpl to id the coefficient name with a colon while in the loop.
+
+for(i in 1:length(int.use)){
+  ## generate formula
+  form = paste0("lgw ~ ",
+                paste(strsplit(int.use[i], ":")[[1]],
+                      collapse = " + "), 
+                " + ", int.use[i],
+                " + s(plantNum, bs = 're')")
+  ## fit our model
+  out.test = gam(formula(form),  
+                 method="REML",
+                 data=datsc.mon15)
+  ## calculate PRR
+  int.eff = aov_interac(dat.pl = dat.pl,
+                        traits=strsplit(int.use[i], ":")[[1]],
+                        modfit=out.test, 
+                        maineff=maineff)
+  
+  ## calculate all the various bits
+  temp = anova(out.test)
+  cur.coef = coefficients(out.test)[grepl(":", names(coefficients(out.test)),fixed=T)]
+  # print(paste(names(cur.coef), int.use[i]))
+  store.df = rbind(store.df,
+                   data.frame(name = names(tail(temp$p.table[,4],1)),
+                              Fstat = tail(temp$pTerms.chi.sq, 1),
+                              p = tail(temp$p.table[,4],1),
+                              mean.eff1 = out.test$coefficients[2], #main effect
+                              mean.eff2 = out.test$coefficients[3], #main effect
+                              coef = cur.coef,
+                              int.eff = int.eff$rel.expl, #%PRV, but in fraction
+                              relmag1 = abs(out.test$coefficients[2]/cur.coef), #IDing how far away switch point is for trait 1
+                              relmag2 = abs(out.test$coefficients[3]/cur.coef), #IDing how far away switch point is for trait 2
+                              resp.min=int.eff$range[1], #minimum of PRR
+                              resp.max=int.eff$range[2] #maxiumum of PRR
+                   )
+                   
+  )
+  #making plot. using strsplit for names -- annoying to read, but useful here
+  gfig = regression_biplots(
+    dat.sc = datsc.mon15,
+    dat.unsc = dat.mon15,
+    mod = out.test,
+    title.cur = paste("Monarch growth regression biplot, p =",round(tail(temp$p.table[,4],1),4)),
+    trait1 = strsplit(int.use[i], ":")[[1]][1],
+    trait1.name = strsplit(int.name.use[i], "-")[[1]][1],
+    trait2 = strsplit(int.use[i], ":")[[1]][2],
+    trait2.name = strsplit(int.name.use[i], "-")[[1]][2],
+    # realval = datsc.mon15$lgw,
+    response.name = "Predicted\nlog(weight)",
+    response.name.dat = ""
+  )
+  
+  ## including switching points:----
+  ## calculating switching points
+  cur.traits = strsplit(int.use[i], ":")[[1]]
+  coef.use = coef(out.test)[c(cur.traits, int.use[i])]
+  switch.1 = (-coef.use[1]/coef.use[3])
+  ## unscale
+  switch.1 = switch.1 * sd(dat.mon15[,cur.traits[1]], na.rm = T) +
+    mean(dat.mon15[,cur.traits[1]], na.rm = T)
+  switch.2 = -coef.use[2]/coef.use[3]
+  switch.2 = switch.2 * sd(dat.mon15[,cur.traits[2]], na.rm = T) +
+    mean(dat.mon15[,cur.traits[2]], na.rm = T)
+  
+  ## adding switching points, but ONLY if it falls in the plotted range.
+  cur.ylim = layer_scales(gfig)$y$get_limits()
+  cur.xlim = layer_scales(gfig)$x$get_limits()
+  gfig = gfig + 
+    geom_point(x = switch.1, y = switch.2, col=col.switch, size = 4, pch = 18)+
+    xlim(cur.xlim)+
+    ylim(cur.ylim)
+  
+  ## save these plots - will load RDS for final figures, supplemental figures.
+  ggsave(file = here(paste0("5_figs/regression biplots/mon15 growth/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".tiff")),
+         gfig,
+         width=12,
+         height=9,
+         dpi=300)
+  saveRDS(file = here(paste0("5_figs/regression biplots/mon15 growth/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".RMD")), gfig)
+}
+
+rownames(store.df)=NULL
+
+
+## store results as worksheet
+addWorksheet(wb, "monarch 2015 growth")
+writeData(wb, "monarch 2015 growth", store.df,
+          headerStyle = hs1)
+
+## also want to aggregate individual regression dataframes together for summary
+res.cur = store.df
+res.cur$data = "monarch growth"
+res.cur = res.cur %>% 
+  rename(test.stat = Fstat)
+res.tot = rbind(res.tot, res.cur)
+
+```
+
+
+```{r, results = 'asis'}
+pander(store.df[order(store.df$p),])
+```
+
+
+#### Survival
+
+
+```{r, warning = FALSE}
+## re-use automated formula-making, since it's the same traits.
+store.df = NULL
+
+#same filtering/cleaning
+dat.pl = datsc.mon15 %>% 
+  mutate(plantNum = as.character(plantNum)) %>% 
+  group_by(plantNum) %>% 
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  select(-weight, -surv, -lgw)
+
+for(i in 1:length(int.use)){
+  form = paste0("surv ~ ",
+                paste(strsplit(int.use[i], ":")[[1]],
+                      collapse = " + "), 
+                " + ", int.use[i],
+                " + s(plantNum, bs = 're')")
+  out.test = gam(formula(form),  
+                 method="REML",
+                 family="binomial",
+                 data=datsc.mon15)
+  #calculate PRR
+  int.eff = aov_interac(dat.pl = dat.pl,
+                        traits=strsplit(int.use[i], ":")[[1]],
+                        modfit=out.test,
+                        maineff = maineff,
+                        inv.link = plogis)
+  temp = anova(out.test)
+  cur.coef = coefficients(out.test)[grepl(":", names(coefficients(out.test)),fixed=T)]
+  print(paste(names(cur.coef), int.use[i]))
+  store.df = rbind(store.df,
+                   data.frame(name = names(tail(temp$p.table[,4],1)),
+                              chistat = tail(temp$pTerms.chi.sq, 1),
+                              p = tail(temp$p.table[,4],1),
+                              mean.eff1 = out.test$coefficients[2],
+                              mean.eff2 = out.test$coefficients[3],
+                              coef=cur.coef,
+                              int.eff = int.eff$rel.expl,
+                              relmag1 = abs(out.test$coefficients[2]/cur.coef),
+                              relmag2 = abs(out.test$coefficients[3]/cur.coef),
+                              resp.min=int.eff$range[1],
+                              resp.max=int.eff$range[2]
+                   )
+  )
+  
+  #making plot
+  gfig = regression_biplots(
+    dat.sc = datsc.mon15,
+    dat.unsc = dat.mon15,
+    mod = out.test,
+    title.cur = paste("Monarch survival regression biplot, p =",round(tail(temp$p.table[,4],1),4)),
+    trait1 = strsplit(int.use[i], ":")[[1]][1],
+    trait1.name = strsplit(int.name.use[i], "-")[[1]][1],
+    trait2 = strsplit(int.use[i], ":")[[1]][2],
+    trait2.name = strsplit(int.name.use[i], "-")[[1]][2],
+    # realval = !is.na(datsc.mon15$lgw),
+    response.name = "Predicted\nsurvival\nprobability",
+    response.name.dat = ""
+  )
+  
+  ## including switching points:
+  ## calculating switching points
+  cur.traits = strsplit(int.use[i], ":")[[1]]
+  coef.use = coef(out.test)[c(cur.traits, int.use[i])]
+  switch.1 = (-coef.use[1]/coef.use[3])
+  ## unscale
+  switch.1 = switch.1 * sd(dat.mon15[,cur.traits[1]], na.rm = T) +
+    mean(dat.mon15[,cur.traits[1]], na.rm = T)
+  switch.2 = -coef.use[2]/coef.use[3]
+  switch.2 = switch.2 * sd(dat.mon15[,cur.traits[2]], na.rm = T) +
+    mean(dat.mon15[,cur.traits[2]], na.rm = T)
+  
+  ## adding switching points, but ONLY if it falls in the plotted range.
+  cur.ylim = layer_scales(gfig)$y$get_limits()
+  cur.xlim = layer_scales(gfig)$x$get_limits()
+  gfig = gfig + 
+    geom_point(x = switch.1, y = switch.2, col=col.switch, size = 4, pch = 18)+
+    xlim(cur.xlim)+
+    ylim(cur.ylim)
+  
+  ggsave(file = here(paste0("5_figs/regression biplots/mon15 survival/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".tiff")),
+         gfig,
+         width=12,
+         height=9,
+         dpi=300)
+  saveRDS(file = here(paste0("5_figs/regression biplots/mon15 survival/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".RMD")), gfig)
+}
+rownames(store.df)=NULL
+
+addWorksheet(wb, "monarch 2015 survival")
+writeData(wb, "monarch 2015 survival", store.df,
+          headerStyle = hs1)
+
+res.cur = store.df
+res.cur$data = "monarch survival"
+res.cur = res.cur %>% 
+  rename(test.stat = chistat)
+res.tot = rbind(res.tot, res.cur)
+```
+
+
+```{r, results = 'asis'}
+pander(store.df[order(store.df$p),])
+```
+
+
+### Beetle{.tabset}
+
+#### Growth
+
+
+```{r, warning = FALSE}
+datsc.cliv16.g$plantNum = as.factor(dat.cliv16.g$plantNum)
+datsc.cliv16.g$date.out = as.factor(dat.cliv16.g$date.out)
+
+dat.pl = datsc.cliv16.g %>% 
+  mutate(plantNum = as.character(plantNum)) %>% 
+  group_by(plantNum) %>% 
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  select(-weight, -lgw) 
+
+## set up automated formula-making
+maineff = c("c8.4", "c10.2", "c.pca", "tough", "trich", "lat")
+maineff.names = c("cardenolide 8.4", "cardenolide 10.2", "cardenolide suite 2016", "leaf toughness", "trichome density", "latex")
+
+names.map = rbind(names.map,
+                  data.frame(basic = maineff, pretty = maineff.names))
+
+#using outer because it's lovely
+int = outer(maineff, 
+            maineff, 
+            FUN = function(x, y){paste0(x,":",y)})
+# now select just the lower triangle (so we only get each interaction once)
+int.use = int[lower.tri(int)]
+
+# again for names
+int.name = outer(maineff.names, 
+                 maineff.names, 
+                 FUN = function(x, y){paste0(x,"-",y)})
+# now select just the lower triangle (so we only get each interaction once)
+int.name.use = int.name[lower.tri(int.name)]
+
+store.df = NULL
+
+for(i in 1:length(int.use)){
+  form = paste0("lgw ~ ",
+                paste(strsplit(int.use[i], ":")[[1]],
+                      collapse = " + "), 
+                " + ", int.use[i],
+                " + s(plantNum, bs = 're')")
+  out.test = gam(formula(form),  
+                 method="REML",
+                 data=datsc.cliv16.g)
+  int.eff = aov_interac(dat.pl = dat.pl,
+                        traits=strsplit(int.use[i], ":")[[1]],
+                        modfit=out.test, 
+                        maineff=maineff)
+  #baseline for testing
+  temp = anova(out.test)
+  cur.coef = coefficients(out.test)[grepl(":", names(coefficients(out.test)),fixed=T)]
+  print(paste(names(cur.coef), int.use[i]))
+  store.df = rbind(store.df,
+                   data.frame(name = names(tail(temp$p.table[,4],1)),
+                              Fstat = tail(temp$pTerms.chi.sq, 1),
+                              p = tail(temp$p.table[,4],1),
+                              mean.eff1 = out.test$coefficients[2],
+                              mean.eff2 = out.test$coefficients[3],
+                              coef = cur.coef,
+                              int.eff = int.eff$rel.expl,
+                              relmag1 = abs(out.test$coefficients[2]/cur.coef),
+                              relmag2 = abs(out.test$coefficients[3]/cur.coef),
+                              resp.min=int.eff$range[1],
+                              resp.max=int.eff$range[2]
+                   )
+  )
+  
+  #making plot
+  gfig = regression_biplots(
+    dat.sc = datsc.cliv16.g,
+    dat.unsc = dat.cliv16.g,
+    mod = out.test,
+    title.cur = paste("Beetle growth regression biplot, p =",round(tail(temp$p.table[,4],1),4)),
+    trait1 = strsplit(int.use[i], ":")[[1]][1],
+    trait1.name = strsplit(int.name.use[i], "-")[[1]][1],
+    trait2 = strsplit(int.use[i], ":")[[1]][2],
+    trait2.name = strsplit(int.name.use[i], "-")[[1]][2],
+    # realval = dat.cliv16.g$lgw,
+    response.name = "Predicted\nlog(weight)",
+    response.name.dat = ""
+  )
+  
+  ## including switching points:
+  ## calculating switching points
+  cur.traits = strsplit(int.use[i], ":")[[1]]
+  coef.use = coef(out.test)[c(cur.traits, int.use[i])]
+  switch.1 = (-coef.use[1]/coef.use[3])
+  ## unscale
+  switch.1 = switch.1 * sd(dat.cliv16.g[,cur.traits[1]], na.rm = T) +
+    mean(dat.cliv16.g[,cur.traits[1]], na.rm = T)
+  switch.2 = -coef.use[2]/coef.use[3]
+  switch.2 = switch.2 * sd(dat.cliv16.g[,cur.traits[2]], na.rm = T) +
+    mean(dat.cliv16.g[,cur.traits[2]], na.rm = T)
+  
+  ## adding switching points, but ONLY if it falls in the plotted range.
+  cur.ylim = layer_scales(gfig)$y$get_limits()
+  cur.xlim = layer_scales(gfig)$x$get_limits()
+  gfig = gfig + 
+    geom_point(x = switch.1, y = switch.2,  col=col.switch, size = 4, pch = 18)+
+    xlim(cur.xlim)+
+    ylim(cur.ylim)
+  
+  ggsave(file = here(paste0("5_figs/regression biplots/cliv16 growth/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".tiff")),
+         gfig,
+         width=12,
+         height=9,
+         dpi=300)
+  saveRDS(file = here(paste0("5_figs/regression biplots/cliv16 growth/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".RMD")), gfig)
+}
+rownames(store.df)=NULL
+
+
+addWorksheet(wb, "beetle 2016 growth")
+writeData(wb, "beetle 2016 growth", store.df,
+          headerStyle = hs1)
+res.cur = store.df
+res.cur$data = "beetle growth"
+res.cur = res.cur %>% 
+  rename(test.stat = Fstat)
+res.tot = rbind(res.tot, res.cur)
+```
+
+
+```{r, results = 'asis'}
+pander(store.df[order(store.df$p),])
+```
+
+
+#### Survival
+
+
+```{r, warning = FALSE}
+store.df = NULL
+
+dat.pl = datsc.cliv16.s %>% 
+  mutate(plantNum = as.character(plantNum)) %>% 
+  group_by(plantNum) %>% 
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  select(-surv) 
+
+for(i in 1:length(int.use)){
+  form = paste0("surv ~ ",
+                paste(strsplit(int.use[i], ":")[[1]],
+                      collapse = " + "), 
+                " + ", int.use[i],
+                "  + s(plantNum, bs = 're')")
+  out.test = gam(formula(form),  
+                 family="binomial",
+                 method="REML",
+                 data=datsc.cliv16.s)
+  int.eff = aov_interac(dat.pl = dat.pl,
+                        traits=strsplit(int.use[i], ":")[[1]],
+                        modfit=out.test,
+                        maineff = maineff,
+                        inv.link = plogis)
+  temp = anova(out.test)
+  cur.coef = coefficients(out.test)[grepl(":", names(coefficients(out.test)),fixed=T)]
+  print(paste(names(cur.coef), int.use[i]))
+  store.df = rbind(store.df,
+                   data.frame(name = names(tail(temp$p.table[,4],1)),
+                              chistat = tail(temp$pTerms.chi.sq, 1),
+                              p = tail(temp$p.table[,4],1),
+                              mean.eff1 = out.test$coefficients[2],
+                              mean.eff2 = out.test$coefficients[3],
+                              coef=cur.coef,
+                              int.eff = int.eff$rel.expl,
+                              relmag1 = abs(out.test$coefficients[2]/int.eff$rel.expl),
+                              relmag2 = abs(out.test$coefficients[3]/int.eff$rel.expl),
+                              resp.min=int.eff$range[1],
+                              resp.max=int.eff$range[2]
+                   )
+  )
+  gfig = regression_biplots(
+    dat.sc = datsc.cliv16.s,
+    dat.unsc = dat.cliv16.s,
+    mod = out.test,
+    title.cur = paste("Beetle survival regression biplot, p =",round(tail(temp$p.table[,4],1),4)),
+    trait1 = strsplit(int.use[i], ":")[[1]][1],
+    trait1.name = strsplit(int.name.use[i], "-")[[1]][1],
+    trait2 = strsplit(int.use[i], ":")[[1]][2],
+    trait2.name = strsplit(int.name.use[i], "-")[[1]][2],
+    # realval = as.factor(dat.cliv16.s$surv),
+    response.name = "Predicted\nsurvival\nprobability",
+    response.name.dat = ""
+  )
+  
+  ## including switching points:
+  ## calculating switching points
+  cur.traits = strsplit(int.use[i], ":")[[1]]
+  coef.use = coef(out.test)[c(cur.traits, int.use[i])]
+  switch.1 = (-coef.use[1]/coef.use[3])
+  ## unscale
+  switch.1 = switch.1 * sd(dat.cliv16.s[,cur.traits[1]], na.rm = T) +
+    mean(dat.cliv16.s[,cur.traits[1]], na.rm = T)
+  switch.2 = -coef.use[2]/coef.use[3]
+  switch.2 = switch.2 * sd(dat.cliv16.s[,cur.traits[2]], na.rm = T) +
+    mean(dat.cliv16.s[,cur.traits[2]], na.rm = T)
+  
+  ## adding switching points, but ONLY if it falls in the plotted range.
+  cur.ylim = layer_scales(gfig)$y$get_limits()
+  cur.xlim = layer_scales(gfig)$x$get_limits()
+  gfig = gfig + 
+    geom_point(x = switch.1, y = switch.2,  col=col.switch, size = 4, pch = 18)+
+    xlim(cur.xlim)+
+    ylim(cur.ylim)
+  
+  
+  ggsave(file = here(paste0("5_figs/regression biplots/cliv16 survival/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".tiff")),
+         gfig,
+         width=12,
+         height=9,
+         dpi=300)
+  saveRDS(file = here(paste0("5_figs/regression biplots/cliv16 survival/",paste0(strsplit(int.use[i], ":")[[1]], collapse = "-"),".RMD")), gfig)
+}
+rownames(store.df)=NULL
+
+
+addWorksheet(wb, "beetle 2016 survival")
+writeData(wb, "beetle 2016 survival", store.df,
+          headerStyle = hs1)
+
+res.cur = store.df
+res.cur$data = "beetle survival"
+res.cur = res.cur %>% 
+  rename(test.stat = chistat)
+res.tot = rbind(res.tot, res.cur)
+```
+
+
+```{r, results = 'asis'}
+pander(store.df[order(store.df$p),])
+```
+
+### prettifying
+
+Making results prettier for saving final files. This involves rounding things, putting %PRV into percentages instead of fractions, identifying antagonism or synergy by sign of interaction term, giving traits their pretty names, clarifying the cardenolide suite names.
+
+```{r}
+## split traits, rename
+## 
+## rename %PRV
+## # combine resp.min and resp.max, labeled as PRR
+## convert coef to relationship
+res.tidy = res.tot %>% 
+  arrange(data, p) %>% 
+  mutate(test.stat = round(test.stat, 4),
+         int.eff = round(int.eff, 2)*100) %>% 
+  select(-mean.eff1, -mean.eff2, -relmag1, -relmag2) %>% 
+  rename("%PRV" = int.eff,
+         "F or chi-square" = test.stat) %>% 
+  mutate(P = ifelse(p<.001, "< .001", round(p, 3))) %>% 
+  mutate(relationship = ifelse(coef > 0, "antagonism", "synergy")) %>% 
+  select(-coef) %>% 
+  mutate(PRR = paste(round(resp.min,2), " -- ", round(resp.max,2))) %>% 
+  select(-resp.min, -resp.max)
+
+#quick renaming mapping for loop
+name.map = matrix(c("inv.sla", "LMA",
+                    "perc.notN", "non-nitrogen",
+                    "perc.C", "carbon",
+                    "tough", "leaf toughness",
+                    "trich", "trichome density",
+                    "c[.]pca", "cardenolide suite",
+                    "lat1", "latex",
+                    "c[.]", "cardenolide ",
+                    "c([0-9])", "cardenolide \\1", #back-referencing capture group.
+                    "lat([:^])", "latex\\1"
+),
+ncol=2,
+byrow = T)
+
+for(i in 1:nrow(name.map)){
+  res.tidy$name = gsub(name.map[i,1], name.map[i,2], res.tidy$name)
+}
+
+traitnames = do.call(rbind,strsplit(res.tidy$name, ":"))
+res.tidy$trait1 = traitnames[,1]
+res.tidy$trait2 = traitnames[,2]
+## need to clean up cardenolide suite
+res.tidy$trait1[res.tidy$trait1=="cardenolide suite" & 
+                  (res.tidy$data == "monarch growth" | res.tidy$data == "monarch survival")]=
+  "cardenolide suite 2015"
+res.tidy$trait1[res.tidy$trait1=="cardenolide suite" & 
+                  (res.tidy$data == "beetle growth" | res.tidy$data == "beetle survival")]=
+  "cardenolide suite 2016"
+res.tidy$trait2[res.tidy$trait2=="cardenolide suite" & 
+                  (res.tidy$data == "monarch growth" | res.tidy$data == "monarch survival")]=
+  "cardenolide suite 2015"
+res.tidy$trait2[res.tidy$trait2=="cardenolide suite" & 
+                  (res.tidy$data == "beetle growth" | res.tidy$data == "beetle survival")]=
+  "cardenolide suite 2016"
+
+res.tidy = res.tidy %>% 
+  select(-name) %>% 
+  rename("trait 1" = trait1,
+         "trait 2" = trait2,
+         "data set" = data)
+## reorder
+res.tidy = res.tidy[,c("data set", "trait 1", "trait 2", "relationship", "F or chi-square", "P", "%PRV", "PRR", "p")]  
+```
+
+
+### Saving
+
+(saving the results as a workbook)
+
+
+
+```{r}
+
+addWorksheet(wb, "all analyses")
+writeData(wb, "all analyses", res.tidy,
+          headerStyle = hs1)
+
+addWorksheet(wb, "summary")
+
+writeData(wb, "summary", res.tidy[round(res.tidy$p,3)<=0.1,],
+          headerStyle = hs1)
+
+
+
+# create style for the first column, which has the interaction name.
+sty = createStyle(textDecoration = "Bold", fontSize = 12)
+
+#loop through the sheets, adding the new style to the first column.
+# also, update the column width to be narrower 
+for(i.sheet in 1:length(names(wb))){
+  addStyle(wb, i.sheet, style = sty, rows=2:100, cols = 1, gridExpand = TRUE)
+  setColWidths(wb, i.sheet, cols = 1, widths = 15)
+}
+
+#create metadata text for an additional sheet of the workbook
+meta.text = c("Results from testing all pairwise trait combinations for synergies or antagonisms using regression models (gam for mixed effects models)",
+              "\`all analysis\` tab contains all results - note that the test statistic represents an F statistic for the growth data and a chi-square statistic for the survival data. Additionally, the coefficient estimates (mean.eff#, int.eff) are on the link scale - so identity for growth data, but logit for survival data.",
+              "\`summary`\ tab contains only those entries whose p value (rounded to the nearest thousandth) is 0.1 or less.",
+              "name - the abbreviated names of both traits, separated by a colon. Note that two traits have been redefined so that high values are expected to be worse for herbivores: sla represents 1/specific leaf area, and perc.N represents 100 - % nitrogen",
+              "Fstat/chistat/test.stat - the appropriate test statistic for the regression, representing the support for the interaction effect as calculated with Anova()",
+              "p - p value of interaction term",
+              "mean.eff1 - main effect of of the first trait when the second trait is at its mean",
+              "mean.eff2 - as above, but for the second trait",
+              "coef - coefficient of interaction term; negative represents synergy and positive represents antagonism",
+              "int.eff - PRV as described in the main text",
+              "relmag1, relmag2 - the magnitudes of each main effect (mean.eff#) divided by the magnitude of the interaction coefficient. Helpful in identify when the defensiveness of a trait is context dependent (e.g. when this is less than 1 or 2, a trait flips between benefiting and harming the herbivore at a value of the other trait that is less than 1 or 2 standard deviations from its mean.",
+              "resp.min, resp.max - the low and high values of the PRR as described in the text.")
+addWorksheet(wb, "meta data")
+writeData(wb, "meta data", meta.text)
+#save the workbook.
+saveWorkbook(wb, 
+             file=here("4_res",                               "regression-results-exploratory.xlsx"),
+             overwrite=T
+)
+
+```
+
+## Table: context dependence
+
+Here we use the total results data frame (`res.tot`) to calculate the switching points for each trait pair.
+
+```{r}
+## quick and dirty:
+## we have TWO traits listed in our name, and TWO relmag values. The first relmag is "what's the first trait's 
+## coefficient divided by the interaction term" -- this is the point in which the SECOND trait flips the
+## context of the first. And vice versa.
+## So first we have the initial trait as the focal trait and relmag1 and the inflection point
+## and then the second trait and relmag2.
+p1 = data.frame(focal = gsub(":.*","",res.tot$name),
+                context = gsub(".*:","",res.tot$name),
+                inflection = res.tot$relmag1,
+                data = res.tot$data, 
+                atmean = res.tot$mean.eff1)
+p2 = data.frame(focal = gsub(".*:","",res.tot$name),
+                context = gsub(":.*","",res.tot$name),
+                inflection = res.tot$relmag2,
+                data = res.tot$data,
+                atmean = res.tot$mean.eff2)
+context.long = rbind(p1, p2)
+
+for(i in seq_len(nrow(names.map))){
+  context.long$focal[context.long$focal==names.map$basic[i]] = names.map$pretty[i]
+  context.long$context[context.long$context==names.map$basic[i]] = names.map$pretty[i]
+  
+}
+
+
+context.res = NULL
+## we only want to look for some pairs of trat+dataset, because we don't have all traits for all datasets.
+do.pairs = unique(context.long[,c("data","focal")])
+for(i in 1:nrow(do.pairs)){
+  cur.context = context.long[context.long$focal == do.pairs$focal[i] & 
+                               context.long$data == do.pairs$data[i],]
+  perc.def = mean(cur.context$atmean<0)
+  cur.res = data.frame(data = do.pairs$data[i],
+                       focal = do.pairs$focal[i], 
+                       perc.def = perc.def,
+                       SD1 = paste0(cur.context$context[cur.context$inflection<1], collapse=", "),
+                       SD2 = paste0(cur.context$context[cur.context$inflection<2 & cur.context$inflection>=1], collapse=", "))
+  context.res = rbind(context.res, cur.res)
+}
+
+write.csv(context.res, file = here("4_res", "context-dependence.csv"), row.names = F)
+
+## supplemental: all switching points and trait tendency (defensive or beneficial to herbivore) at mean values.
+
+context.sup = context.long %>% 
+  mutate("effect at mean" = ifelse(atmean>0, "beneficial to herbivore", "defensive")) %>% 
+  rename("switching point" = inflection,
+         "focal trait" = focal,
+         "context trait" = context) %>% 
+  select(-atmean) %>% 
+  relocate(data)
+write.csv(context.sup, file = here("4_res", "context-dependence-all.csv"), row.names = F)
+```
+
+
+## Figure 4: regression results
+
+Note: used `-` to separate interaction names above. Consequently, non-nitrogen didn't include the dash. Adding in manually with `xlab()` here.
+```{r}
+theme.sub = 
+  theme(plot.title = element_text(face="bold", size=16),
+        text=element_text(size=rel(4)),
+        legend.title = element_text(size=14),
+        legend.text = element_text(size=14),
+        axis.text = element_text(size=14),
+        legend.key.height = unit(.5, "cm"),
+        legend.title.align=0.5,
+        panel.background = element_blank()
+  )
+
+gg.subs = list()
+gg.subs[[1]] = readRDS(here("5_figs/regression biplots/mon15 growth/perc.notN-inv.sla.RMD"))+    ggtitle("(a) Monarch growth, synergy")+theme.sub+xlab("non-nitrogen (%)")
+
+gg.subs[[2]] = readRDS(here("5_figs/regression biplots/mon15 growth/tough-perc.C.RMD"))+
+  ggtitle("(b) Monarch growth, synergy")+theme.sub
+
+gg.subs[[3]] = readRDS(here("5_figs/regression biplots/mon15 growth/trich-perc.notN.RMD"))+
+  ggtitle("(c) Monarch growth, synergy")+theme.sub+ylab("non-nitrogen (%)")
+
+gg.subs[[4]] = readRDS(here("5_figs/regression biplots/mon15 growth/tough-trich.RMD"))+
+  ggtitle("(d) Monarch growth, synergy")+theme.sub
+
+gg.subs[[5]] = readRDS(here("5_figs/regression biplots/mon15 growth/tough-perc.notN.RMD"))+
+  ggtitle("(e) Monarch growth, synergy")+theme.sub+ylab("non-nitrogen (%)")
+
+gg.subs[[6]] = readRDS(here("5_figs/regression biplots/mon15 growth/perc.notN-c.18.6.RMD"))+
+  ggtitle("(f) Monarch growth, antagonism")+theme.sub+xlab("non-nitrogen (%)")
+
+gg.subs[[7]] = readRDS(here("5_figs/regression biplots/mon15 growth/tough-c.18.6.RMD"))+
+  ggtitle("(g) Monarch growth, antagonism")+theme.sub
+
+gg.subs[[8]] = readRDS(here("5_figs/regression biplots/mon15 growth/c.18.6-inv.sla.RMD"))+
+  ggtitle("(h) Monarch growth, antagonism")+theme.sub
+
+gg.subs[[9]] = readRDS(here("5_figs/regression biplots/mon15 survival/lat1-c.18.6.RMD"))+
+  ggtitle("(i) Monarch survival, synergy")+theme.sub
+
+gg.subs[[10]] = readRDS(here("5_figs/regression biplots/cliv16 growth/lat-c10.2.RMD"))+
+  ggtitle("(j) Beetle growth, synergy")+theme.sub
+
+gg.subs[[11]] = readRDS(here("5_figs/regression biplots/cliv16 growth/lat-tough.RMD"))+
+  ggtitle("(k) Beetle growth, synergy")+theme.sub
+
+gg.subs[[12]] = readRDS(here("5_figs/regression biplots/cliv16 growth/c.pca-c8.4.RMD"))+
+  ggtitle("(l) Beetle growth, antagonism")+theme.sub
+# 
+# gg.subs[[13]] = readRDS(here("5_figs/regression biplots/cliv16 survival/lat-c10.2.RMD"))+
+#   ggtitle("(m) Clivicollis survival, synergy")+theme.sub
+# 
+
+
+
+gg.fig1 = plot_grid(plotlist = gg.subs,
+                    ncol=3,align="v")
+
+
+gfig_saver(gg.fig1,
+           filename="finals/fig-4",
+           description="publishable",
+           width=16, 
+           height=16)
+ggsave(gg.fig1,
+       filename=here("5_figs/finals/fig-4.pdf"),
+       width=16, 
+       height=16)
+
+```
+
+
+## Diagnostic plots with known interaction patterns {#diagnostics}
+
+Here we generate the diagnostic plots used to evaluate whether our random forest methods were identifying synergies or antagonisms.
+
+#### Function definition
+
+```{r}
+###################
+## "diff" plotting
+
+## define theme
+
+theme.fig3 =
+  theme(plot.title = element_text(face="bold", size=20),
+        text=element_text(size=rel(4)),
+        legend.title = element_text(size=16),
+        legend.text = element_text(size=15),
+        legend.key.size = unit(.5, "cm"),
+        plot.margin = unit(c(0, 0, 0, 0), "cm"),
+        legend.key.height = unit(1, "cm")
+  )
+
+#create a function to evaluate a given scenario
+scenario_calc = function(syn_scenario, #function defining relationship
+                         nx.small = 10, #resolution of course plot
+                         nx.big = 100, #resolution of fine plot
+                         theme.mine = NULL, #ggplot theme
+                         flag.plot = TRUE #if true, call plotting function.
+){
+  # Designed for exploring potential "random forest output" shapes
+  #   from hypothetical, defined synergies. (note: this function doesn't depend on Random Forests in any way, but is 
+  #   designed to help interpret the output of our random forest approach
+  # This function takes a given "scenario" function like this:
+  # syn_scenario = function(x,y){
+  #   return( 10 - x - y + x*y) 
+  # }
+  # it then calculates and plots the response across a grid from 0 to 1
+  # as well as calculating and plotting the "difference from additive" 
+  # For exploring plant defense synergies, I recommend defaulting to x and y reducing the response (e.g. defense reduces growth)
+  ########################
+  # It returns a list with 
+  #  g.full: ggplot figure; evaluation of the scenario function through space with high resolution
+  #  g.rf: as g.full, but for much lower resolution. Should resemble random forest model predictions
+  #  g.diff: plotting of the difference between r.rf and additive predictions based on the same data.
+  #  title.grob: a ggplot object convenient for creating titles in multi-plots.
+  #  based on the first full line of the syn_scenario function
+  
+  ## create default theme if it doesn't exist
+  if(is.null(theme.mine)){
+    theme.mine=theme(plot.title = element_text(face="bold", size=24),
+                     text=element_text(size=rel(5)),
+                     legend.text = element_text(size=rel(3)))
+  }
+  ## we're going to treat herbivore performance as 10 - syn_scenario, so that our synergy function is easier to think about.
+  
+  herb_perf = function(x,y)(10-syn_scenario(x,y))
+  x = y = seq(0,1,length=nx.big);
+  U.big = expand.grid(x,y);
+  dat.cur = data.frame(x = U.big[,1],
+                       y = U.big[,2])
+  dat.cur$z = herb_perf(x = dat.cur$x,
+                        y = dat.cur$y)
+  
+  ## calculate initial plot by approximating derivative
+  x.pred=seq(0,1,by=.01)
+  h=.01 #small step
+  y.pred1 = syn_scenario(x = x.pred,
+                         y=.5-h/2)
+  y.pred2 = syn_scenario(x = x.pred,
+                         y=.5+h/2)
+  y.deriv = (y.pred2-y.pred1)/h
+  
+  
+  g.fun = ggplot()+
+    geom_path(aes(x=x.pred, y = y.deriv), size=2)+
+    xlab("Trait X")+
+    ylab("Per-unit benefit of trait Y")+
+    theme.mine
+  
+  g.full = ggplot(dat.cur, aes(x=x, y=y)) +
+    geom_tile(aes(fill=z))+
+    labs(fill = "Response") +
+    # ggtitle("Underlying function") +
+    xlab("trait X")+
+    ylab("trait Y")+
+    theme.mine
+  
+  
+  x = y = seq(0,1,length=nx.small);
+  U.small = expand.grid(x,y);
+  dat.cur = data.frame(x = U.small[,1],
+                       y = U.small[,2])
+  dat.cur$z=herb_perf(x = dat.cur$x,
+                      y = dat.cur$y)
+  
+  g.rf = ggplot(dat.cur, aes(x=x, y=y)) +
+    geom_tile(aes(fill=z))+
+    labs(fill = "herbivore\nresponse") +
+    # ggtitle("Discretized function") +
+    xlab("Trait X")+
+    ylab("Trait Y")+
+    theme.mine
+  
+  ## Calculate the difference from additive expectations
+  
+  dat.fit = data.frame(x =dat.cur$x,
+                       y = dat.cur$y,
+                       x.fac = as.character(dat.cur$x),
+                       y.fac = as.character(dat.cur$y),
+                       z = dat.cur$z)
+  mod.add = lm(z ~ x.fac + y.fac, data = dat.fit)
+  
+  
+  dat.fit$pred = predict(mod.add, newdata=dat.fit)
+  dat.fit$diff = dat.fit$z - dat.fit$pred
+  
+  
+  g.diff = ggplot(dat.fit, aes(x=x, y=y)) +
+    geom_tile(aes(fill=diff))+
+    labs(fill = "non-additivity\nof response") +
+    # ggtitle("Deviations from additive") +
+    scale_fill_gradient2(low = muted("blue"),
+                         high = muted("red")) +
+    xlab("Trait X")+
+    ylab("Trait Y")+
+    theme.mine
+  
+  if(flag.plot == TRUE){
+    grid.arrange(g.fun, g.rf, g.diff, 
+                 nrow=1
+    )
+  }
+  
+  return(list (g.fun = g.fun,
+               g.full = g.full,
+               g.rf = g.rf, 
+               g.diff = g.diff
+  ))
+}
+```
+
+#### Exploration {#diagexplor}
+
+Here we explore some potential synergies. They all produce qualitatively similar patterns in residuals (the third panel), as reported in the main text.
+
+```{r diagnostics exploration, fig.height = 6, fig.width = 12}
+
+## Example:
+##  multiplicative synergy
+# define synergy
+syn_scenario = function(x,y){
+  return( x + y + x*y) 
+}
+#call synergy function
+syn.lin = scenario_calc(syn_scenario, theme.mine = theme.fig3)
+
+## multiplicative anti-synergy
+syn_scenario = function(x,y){
+  return( x + y - x*y) 
+}
+anti.lin = scenario_calc(syn_scenario, theme.mine = theme.fig3)
+
+## threshold (y increases in efficacy if x > 0.5)
+syn_scenario = function(x,y){
+  return( x + y + y*(x>.6)) 
+}
+syn.thresh = scenario_calc(syn_scenario, theme.mine = theme.fig3)
+
+##diminishing marginal returns
+syn_scenario = function(x,y){
+  return( x + y + 2*x*y/(1+2*x*y)) 
+}
+syn.dmr = scenario_calc(syn_scenario, theme.mine = theme.fig3)
+
+## censored multiplicative synergy
+syn_scenario = function(x,y){
+  return( x + y + x*y*(x>.7)) 
+}
+syn.weird = scenario_calc(syn_scenario, theme.mine = theme.fig3)
+
+syn_scenario = function(x,y){
+  return( x + y + 1/(x*y+1)) 
+}
+anti.decay = scenario_calc(syn_scenario, theme.mine = theme.fig3)
+
+syn_scenario = function(x,y){
+  return( x + y - y*(x>.6)) 
+}
+anti.thresh = scenario_calc(syn_scenario, theme.mine = theme.fig3)
+```
+
+#### Figure 3
+
+```{r}
+
+theme.fig3.sub = theme(plot.title = element_text(face="bold", size=20),
+                       text=element_text(size=rel(4)),
+                       axis.text = element_text(size=14),
+                       legend.title = element_text(size=16),
+                       legend.text = element_text(size=14),
+                       legend.key.size = unit(.5, "cm"),
+                       legend.key.height = unit(.8, "cm"),
+                       panel.background = element_blank(),
+                       plot.margin = unit(c(0, 0, 0, 0), "cm")
+                       
+)
+theme.lineplot = theme(axis.line.x = element_line(size = 1),
+                       axis.line.y = element_line(size = 1))
+
+gg.syn.lin=plot_grid(syn.lin$g.fun+theme.fig3.sub+theme.lineplot,
+                     NULL,
+                     syn.lin$g.rf+theme.fig3.sub, 
+                     NULL,
+                     syn.lin$g.diff+theme.fig3.sub, 
+                     nrow=1, ncol=5, 
+                     rel_widths = c(.7,.05, 1,.05,1),
+                     axis="lr")
+gg.anti.lin=plot_grid(anti.lin$g.fun+theme.fig3.sub+theme.lineplot, 
+                      NULL,
+                      anti.lin$g.rf+theme.fig3.sub, 
+                      NULL,
+                      anti.lin$g.diff+theme.fig3.sub, 
+                      nrow=1, ncol=5, 
+                      rel_widths = c(.7,.05, 1,.05,1),
+                      axis="lr")
+gg.syn.thresh=plot_grid(syn.thresh$g.fun+theme.fig3.sub+theme.lineplot, 
+                        NULL,
+                        syn.thresh$g.rf+theme.fig3.sub, 
+                        NULL,
+                        syn.thresh$g.diff+theme.fig3.sub, 
+                        nrow=1, ncol=5, 
+                        rel_widths = c(.7,.05, 1,.05,1),
+                        axis="lr")
+gg.syn.dmr=plot_grid(syn.dmr$g.fun+theme.fig3.sub+theme.lineplot, 
+                     NULL,
+                     syn.dmr$g.rf+theme.fig3.sub, 
+                     NULL,
+                     syn.dmr$g.diff+theme.fig3.sub, 
+                     nrow=1, ncol=5, 
+                     rel_widths = c(.7,.05, 1,.05,1),
+                     axis="lr")
+gg.anti.decay=plot_grid(anti.decay$g.fun+theme.fig3.sub+theme.lineplot, 
+                        NULL,
+                        anti.decay$g.rf+theme.fig3.sub, 
+                        NULL,
+                        anti.decay$g.diff+theme.fig3.sub, 
+                        nrow=1, ncol=5, 
+                        rel_widths = c(.7,.05, 1,.05,1),
+                        axis="lr")
+gg.anti.thresh=plot_grid(anti.thresh$g.fun+theme.fig3.sub+theme.lineplot, 
+                         NULL,
+                         anti.thresh$g.rf+theme.fig3.sub, 
+                         NULL,
+                         anti.thresh$g.diff+theme.fig3.sub, 
+                         nrow=1, ncol=5, 
+                         rel_widths = c(.7,.05, 1,.05,1),
+                         axis="lr")
+
+gg.fig3 = ggarrange(text_grob("Synergies", size=20),
+                    gg.syn.lin,
+                    NULL, 
+                    gg.syn.thresh, 
+                    NULL, 
+                    gg.syn.dmr, 
+                    NULL,
+                    text_grob("Antagonisms",size=20),
+                    gg.anti.lin,
+                    NULL,
+                    gg.anti.thresh,
+                    NULL,
+                    gg.anti.decay,
+                    ncol=1,
+                    widths=1,
+                    heights=c(.2, 1, 0.1, 1, .1, 1, .1, .2, 1, .2, 1, .1, 1),
+                    labels = c("", "(a) bilinear synergy", 
+                               "", "(b) threshold synergy",
+                               "","(c) DMR synergy",
+                               "", "", "(d) bilinear antagonism",
+                               "","(e) threshold antagonism", 
+                               "", "(f) decaying antagonism"),
+                    vjust = -.5,
+                    hjust = -.4
+                    
+)
+
+gfig_saver(gg.fig3,
+           filename="finals/fig-3",
+           description="publishable",
+           width=14, 
+           height=24)
+ggsave(filename=here("5_figs/finals/fig-3.pdf"),
+       gg.fig3,
+       width=14, 
+       height=24)
+
+```
+
+## Random Forest{.tabset}
+
+The heavy lifting of the analyses was done in separate scripts (see `rf-interactions-analysis.R`), which takes quite a long time to run. Here we are reading in the results of those analyses, summarizing and plotting.
+
+```{r}
+#make object for storing summary
+rf.sum=NULL
+#make new workbook
+wb = createWorkbook()
+#list for storing ALL random forest figures, for easier supplemental figuremaking.
+readyfig.ls = list()
+```
+
+
+```{r}
+theme.sub = 
+  theme(plot.title = element_text(face="bold", size=16),
+        # text=element_text(size=rel(4)),
+        legend.title = element_text(size=16),
+        legend.text = element_text(size=14),
+        axis.text = element_text(size=16),
+        axis.title = element_text(size=18),
+        legend.key.height = unit(1, "cm"),
+        legend.title.align=0.5
+        
+  )
+
+```
+
+### Monarch{.tabset}
+
+#### Growth
+
+##### Classification and plotting
+
+```{r}
+## read in results from external analysis (see rf-interactions-analysis.R)
+dat.cur=readRDS(file=here("4_res", "rf-plotdat/rf-plotdat-monag-indiv.RDS"))
+names(dat.cur)
+## create dataframe to loop over
+rf.do = data.frame(int.name = names(dat.cur))
+#get trait names
+rf.do$t1 = gsub("x.*","",rf.do$int.name)
+rf.do$t2 = gsub(".*x","",rf.do$int.name)
+
+#replace raw trait names with human readable ones for plotting
+# unique(c(rf.do$t1, rf.do$t2))
+# NOTE: updated code to use perc.notN and inv.sla in the future.
+# early iterations listed 100-perc.N and 1/sla as `perc.N` and `sla`.
+# Leaving that name mapping here as well, so I don't have to rerun the analysis to relabel things.
+names.map = data.frame(raw = c("lat1", 
+                               "inv.sla",
+                               "tough",
+                               "trich",
+                               "c.10.5",
+                               "c.18.6",
+                               "c.pca",
+                               "perc.notN",
+                               "perc.C"),
+                       pretty = c("latex", 
+                                  "LMA",
+                                  "leaf toughness",
+                                  "trichome density",
+                                  "cardenolide 10.5",
+                                  "cardenolide 18.6",
+                                  "cardenolide suite 2015",
+                                  "non-nitrogen",
+                                  "carbon")
+)
+## relabeling rf.do$t1 and $t2 to be pretty
+for(i in 1:nrow(names.map)){
+  rf.do$t1 = gsub(names.map$raw[i], names.map$pretty[i], rf.do$t1)
+  rf.do$t2 = gsub(names.map$raw[i], names.map$pretty[i], rf.do$t2)
+}
+
+rf.class = NULL
+
+## now iterate over each trait pair, and carry out our permutation testing to 
+## classify the interaction as antagonism, synergy, or unclear
+for (i.row in 1:nrow(rf.do)){
+  class.cur = rf_class(rf.obj = dat.cur[[rf.do$int.name[i.row]]],
+                       t1.name = rf.do$t1[i.row],
+                       t2.name =  rf.do$t2[i.row],
+                       resp.name = "log final mass",
+                       dat = datsc.mon15 %>%
+                         drop_na(),
+                       dat.unsc = dat.mon15
+  )
+  # store results
+  rf.class = rbind(rf.class,
+                   data.frame(exper = "Monarch Growth", 
+                              resp.name = "log final weight",
+                              interaction = gsub("x",":",rf.do$int.name[i.row]), #for consistency with other calculation
+                              t1 = rf.do$t1[i.row],
+                              t2.name =  rf.do$t2[i.row],
+                              class.cur$theta.best))
+  #save various versions of figures in RDS and tiff form
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/mon15g-",rf.do$int.name[i.row],"-all.RDS")))
+  gg.readyfig = plot_grid(text_grob("Monarch Growth",size=20),
+                          plot_grid(class.cur$g.rf+theme.sub,
+                                    class.cur$g.class+theme.sub,
+                                    nrow=1), 
+                          ncol=1,
+                          rel_heights = c(.08, 1))
+  readyfig.ls[[paste0("mon15g.",rf.do$int.name[i.row])]] = gg.readyfig
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/mon15g-readyfig-",rf.do$int.name[i.row],"-all.RDS")))
+  ggsave(here(paste0("5_figs/rf biplots/mon15g-",rf.do$int.name[i.row],".tiff")),
+         gg.readyfig,
+         width = 15, height=7
+  )
+}
+
+```
+
+##### Summarizing PRR and PRR %
+
+```{r}
+## reading in the data
+ss = readRDS(here("4_res","rf-int-monag-fin-indiv.RDS"))
+## storing relevant pieces to data frame
+res.cur=data.frame(interaction = ss$name, #trait name
+                   percent.total = ss$SS.int/ss$SS.tot*100, #%PRV
+                   response.min = ss$response.min, #minimum of PRR
+                   response.max = ss$response.max) #maximum of PRR
+res.cur = merge(res.cur, rf.class)
+rf.sum=rbind(rf.sum, res.cur)
+
+pander(res.cur)
+
+addWorksheet(wb, "monarch growth")
+writeData(wb, "monarch growth", res.cur,
+          headerStyle = hs1)
+```
+
+
+
+#### Survival
+
+
+##### Classification and plotting
+
+```{r}
+
+dat.cur=readRDS(file=here("4_res", "rf-plotdat/rf-plotdat-monas-indiv.RDS"))
+# names(dat.cur)
+
+#re-use names.map from above. Same data set
+
+
+rf.class = NULL
+
+for (i.row in 1:nrow(rf.do)){
+  class.cur = rf_class(rf.obj = dat.cur[[rf.do$int.name[i.row]]],
+                       t1.name = rf.do$t1[i.row],
+                       t2.name =  rf.do$t2[i.row],
+                       resp.name = "survival probability",
+                       dat = datsc.mon15 %>%
+                         drop_na(),
+                       dat.unsc = dat.mon15
+  )
+  rf.class = rbind(rf.class,
+                   data.frame(exper = "Monarch Survival", 
+                              resp.name = "survival\nprobability",
+                              interaction = gsub("x",":",rf.do$int.name[i.row]), #for consistency with other calculation,
+                              t1 = rf.do$t1[i.row],
+                              t2.name =  rf.do$t2[i.row],
+                              class.cur$theta.best))
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/mon15s-",rf.do$int.name[i.row],"-all.RDS")))
+  gg.readyfig = plot_grid(text_grob("Monarch Survival",size=20),
+                          plot_grid(class.cur$g.rf+theme.sub,
+                                    class.cur$g.class+theme.sub,
+                                    nrow=1), 
+                          ncol=1,
+                          rel_heights = c(.08, 1))
+  readyfig.ls[[paste0("mon15s.",rf.do$int.name[i.row])]] = gg.readyfig
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/mon15s-readyfig-",rf.do$int.name[i.row],"-all.RDS")))
+  ggsave(here(paste0("5_figs/rf biplots/mon15s-",rf.do$int.name[i.row],".tiff")),
+         gg.readyfig,
+         width = 15, height=7
+  )
+}
+
+```
+
+##### Summarizing PRR and PRR %
+
+```{r}
+ss = readRDS(here("4_res","rf-int-monas-fin-indiv.RDS"))
+res.cur=data.frame(interaction = ss$name,
+                   percent.total = ss$SS.int/ss$SS.tot*100,
+                   response.min = ss$response.min,
+                   response.max = ss$response.max)
+res.cur = merge(res.cur, rf.class)
+rf.sum=rbind(rf.sum, res.cur)
+
+pander(res.cur)
+addWorksheet(wb, "monarch survival")
+writeData(wb, "monarch survival", res.cur,
+          headerStyle = hs1)
+```
+
+
+
+
+
+### Beetles{.tabset}
+
+#### Growth
+
+
+##### Classification and plotting
+
+```{r}
+dat.cur=readRDS(file=here("4_res", "rf-plotdat/rf-plotdat-clivg-indiv.RDS"))
+names(dat.cur)
+## create dataframe to loop over
+rf.do = data.frame(int.name = names(dat.cur))
+#get trait names
+rf.do$t1 = gsub("x.*","",rf.do$int.name)
+rf.do$t2 = gsub(".*x","",rf.do$int.name)
+
+#replace raw trait names with human readable ones for plotting
+# unique(c(rf.do$t1, rf.do$t2))
+names.map = data.frame(raw = c("trich", 
+                               "tough",
+                               "lat",
+                               "c8.4",
+                               "c10.2",
+                               "c.pca"
+),
+
+pretty = c("trichome density",
+           "leaf toughness",
+           "latex",
+           "cardenolide 8.4",
+           "cardenolide 10.2",
+           "cardenolide suite 2016"
+)
+)
+
+## relabeling rf.do$t1 and $t2 to be pretty
+for(i in 1:nrow(names.map)){
+  rf.do$t1 = gsub(names.map$raw[i], names.map$pretty[i], rf.do$t1)
+  rf.do$t2 = gsub(names.map$raw[i], names.map$pretty[i], rf.do$t2)
+}
+
+rf.class = NULL
+
+for (i.row in 1:nrow(rf.do)){
+  class.cur = rf_class(rf.obj = dat.cur[[rf.do$int.name[i.row]]],
+                       t1.name = rf.do$t1[i.row],
+                       t2.name =  rf.do$t2[i.row],
+                       resp.name = "growth rate",
+                       dat = datsc.cliv16.g %>%
+                         drop_na(),
+                       dat.unsc = dat.cliv16.g
+  )
+  rf.class = rbind(rf.class,
+                   data.frame(exper = "Beetle Growth", 
+                              resp.name = "log final mass",
+                              interaction = gsub("x",":",rf.do$int.name[i.row]), #for consistency with other calculation
+                              t1 = rf.do$t1[i.row],
+                              t2.name =  rf.do$t2[i.row],
+                              class.cur$theta.best))
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/cliv16g-",rf.do$int.name[i.row],"-all.RDS")))
+  gg.readyfig = plot_grid(text_grob("Beetle Growth", size=20),
+                          plot_grid(class.cur$g.rf+theme.sub,
+                                    class.cur$g.class+theme.sub,
+                                    nrow=1),
+                          ncol=1, rel_heights = c(.08, 1))
+  readyfig.ls[[paste0("cliv16g.",rf.do$int.name[i.row])]] = gg.readyfig
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/cliv16g-readyfig-",rf.do$int.name[i.row],"-all.RDS")))
+  ggsave(here(paste0("5_figs/rf biplots/cliv16g-",rf.do$int.name[i.row],".tiff")),
+         gg.readyfig,
+         width = 15, height=7
+  )
+}
+
+```
+
+##### Summarizing PRR and PRR %
+
+```{r}
+ss = readRDS(here("4_res","rf-int-clivg-fin-indiv.RDS"))
+res.cur=data.frame(interaction = ss$name,
+                   percent.total = ss$SS.int/ss$SS.tot*100,
+                   response.min = ss$response.min,
+                   response.max = ss$response.max)
+res.cur = merge(res.cur, rf.class)
+rf.sum=rbind(rf.sum, res.cur)
+pander(res.cur)
+
+
+addWorksheet(wb, "beetle growth")
+writeData(wb, "beetle growth", res.cur,
+          headerStyle = hs1)
+```
+
+#### Survival
+
+##### Classification and plotting
+
+
+```{r}
+dat.cur=readRDS(file=here("4_res", "rf-plotdat/rf-plotdat-clivs-indiv.RDS"))
+# names(dat.cur)
+
+#re-use names.map from above. Same data set
+
+
+rf.class = NULL
+
+for (i.row in 1:nrow(rf.do)){
+  class.cur = rf_class(rf.obj = dat.cur[[rf.do$int.name[i.row]]],
+                       t1.name = rf.do$t1[i.row],
+                       t2.name =  rf.do$t2[i.row],
+                       resp.name = "survival probability",
+                       dat = datsc.cliv16.s %>%
+                         drop_na(),
+                       dat.unsc = dat.cliv16.s
+  )
+  rf.class = rbind(rf.class,
+                   data.frame(exper = "Beetle Survival", 
+                              resp.name = "survival\nprobability",
+                              interaction = gsub("x",":",rf.do$int.name[i.row]), #for consistency with other calculation,
+                              t1 = rf.do$t1[i.row],
+                              t2.name =  rf.do$t2[i.row],
+                              class.cur$theta.best))
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/cliv16s-",rf.do$int.name[i.row],"-all.RDS")))
+  gg.readyfig = plot_grid(text_grob("Beetle Survival", size=20),
+                          plot_grid(class.cur$g.rf+theme.sub,
+                                    class.cur$g.class+theme.sub,
+                                    nrow=1),
+                          ncol=1, rel_heights = c(.08, 1))
+  readyfig.ls[[paste0("cliv16s.",rf.do$int.name[i.row])]] = gg.readyfig
+  saveRDS(class.cur,
+          here(paste0("5_figs/rf biplots/cliv16s-readyfig-",rf.do$int.name[i.row],"-all.RDS")))
+  ggsave(here(paste0("5_figs/rf biplots/cliv16s-",rf.do$int.name[i.row],".tiff")),
+         gg.readyfig,
+         width = 15, height=7
+  )
+}
+```
+
+##### Summarizing PRR and PRR %
+
+```{r}
+ss = readRDS(here("4_res","rf-int-clivs-fin-indiv.RDS"))
+res.cur=data.frame(interaction = ss$name,
+                   percent.total = ss$SS.int/ss$SS.tot*100,
+                   response.min = ss$response.min,
+                   response.max = ss$response.max)
+res.cur = merge(res.cur, rf.class)
+rf.sum=rbind(rf.sum, res.cur)
+
+pander(res.cur)
+
+
+addWorksheet(wb, "beetle survival")
+writeData(wb, "beetle survival", res.cur,
+          headerStyle = hs1)
+```
+
+### Prettifying
+
+```{r}
+## split traits, rename
+## 
+## rename %PRV
+## # combine resp.min and resp.max, labeled as PRR
+## convert coef to relationship
+res.tidy = rf.sum %>% 
+  select(-resp.name,-t1, -t2.name, -c1, -c2, -theta, -null.025, -null.975)
+res.tidy$exper = tolower(gsub(" 201[5-6]", "", res.tidy$exper))
+res.tidy = res.tidy %>% 
+  arrange(desc(percent.total)) %>% 
+  mutate("%PRV" = round(percent.total)) %>% 
+  select(-percent.total) %>% 
+  rename(relationship = int.class) %>% 
+  mutate(PRR = paste(round(response.min,2), " -- ", round(response.max,2))) %>% 
+  select(-response.min, -response.max)
+
+#quick renaming mapping for loop
+
+for(i in 1:nrow(name.map)){
+  res.tidy$interaction = gsub(name.map[i,1], name.map[i,2], res.tidy$interaction)
+}
+
+
+traitnames = do.call(rbind,strsplit(res.tidy$interaction, ":"))
+res.tidy$trait1 = traitnames[,1]
+res.tidy$trait2 = traitnames[,2]
+## need to clean up cardenolide suite
+res.tidy$trait1[res.tidy$trait1=="cardenolide suite" & 
+                  (res.tidy$exper == "monarch growth" | res.tidy$exper == "monarch survival")]=
+  "cardenolide suite 2015"
+res.tidy$trait1[res.tidy$trait1=="cardenolide suite" & 
+                  (res.tidy$exper == "beetle growth" | res.tidy$exper == "beetle survival")]=
+  "cardenolide suite 2016"
+
+res.tidy$trait2[res.tidy$trait2=="cardenolide suite" & 
+                  (res.tidy$exper == "monarch growth" | res.tidy$exper == "monarch survival")]=
+  "cardenolide suite 2015"
+res.tidy$trait2[res.tidy$trait2=="cardenolide suite" & 
+                  (res.tidy$exper == "beetle growth" | res.tidy$exper == "beetle survival")]=
+  "cardenolide suite 2016"
+
+res.tidy = res.tidy %>% 
+  select(-interaction) %>% 
+  rename("trait 1" = trait1,
+         "trait 2" = trait2,
+         "data set" = exper)
+## reorder
+res.tidy = res.tidy[,c("data set", "trait 1", "trait 2", "relationship", "%PRV", "PRR")]  
+```
+
+
+### Summary
+
+Here we look at those interactions with reasonably strong interactions, as defined by % variation explained.
+
+#### All interaction with >5% total PRR interaction, clear pattern
+
+```{r, results = 'asis'}
+tab.plot = res.tidy[res.tidy[,"%PRV"]>5,]
+tab.plot = tab.plot[tab.plot$relationship != "unclear", ]
+row.names(tab.plot) = NULL
+pander(tab.plot)
+
+addWorksheet(wb, "All")
+writeData(wb, "All", res.tidy,
+          headerStyle = hs1)
+
+addWorksheet(wb, "summary")
+writeData(wb, "summary", tab.plot,
+          headerStyle = hs1)
+```
+
+##### Saving
+
+```{r}
+saveRDS(readyfig.ls,
+        here("5_figs/rf biplots/readyfigs-list-all.RDS"))
+
+for(i.sheet in 1:length(names(wb))){
+  addStyle(wb, i.sheet, style = sty, rows=2:100, cols = 1, gridExpand = TRUE)
+  setColWidths(wb, i.sheet, cols = 1, widths = 15)
+}
+
+meta.text = c("Results from Random Forest / ANOVA combo approach, applied to all pairwise trait combinations.",
+              "percent.total - percent of total variation (SS) of the response explained by the interaction term.",
+              "percent.parents - percent SS explained by the interaction term compared to the parent (main effect) terms. 50% would mean the main effects and the interaction term explain equal amounts of variation.",
+              "summary sheet has extracted all interaction swith percent.total >=15%. Final column in that sheet identifies which data set the interaction was idenitfied in.")
+addWorksheet(wb, "meta data")
+writeData(wb, "meta data", meta.text)
+saveWorkbook(wb, 
+             file=here("4_res/RF-results-exploratory.xlsx"),
+             overwrite=T
+)
+```
+
+## Figure 5: random forest results
+
+```{r}
+#we'll read in our saved readfigs list, just so that we can recreate this plot without the ~30 min compile time for lines above.
+# readyfig.ls = readRDS(here("5_figs/rf biplots/readyfigs-list-all.RDS"))
+
+# pdf(here("5_figs/finals/supp-rf-all.pdf"), width= 12, height=14, onefile=T)
+# 
+theme.mod = theme(legend.key.width = unit(.5,'cm'),
+                  legend.key.height = unit(1, "cm"),
+                  panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+)
+
+temp = readRDS(here("5_figs/rf biplots/mon15s-lat1xtrich-all.RDS"))
+gg.1 =temp$g.rf + 
+  theme.mod + 
+  labs(fill="survival\nprobability")
+gg.2 = temp$g.class + 
+  theme.mod +
+  labs(name="non-additivity\nof survival\nprobability")
+
+
+temp = readRDS(here("5_figs/rf biplots/mon15s-inv.slaxc.10.5-all.RDS"))
+gg.3 = temp$g.rf + theme.mod + labs(fill="survival\nprobability")
+gg.4 = temp$g.class + theme.mod
+
+temp = readRDS(here("5_figs/rf biplots/mon15s-toughxtrich-all.RDS"))
+gg.5 = temp$g.rf + theme.mod + labs(fill="survival\nprobability")
+gg.6 = temp$g.class + theme.mod
+
+
+
+g.fin = 
+  plot_grid(text_grob("(a) Monarch survival, synergy", size=30), NULL,
+            gg.1, gg.2+ggtitle("residuals of additive model"), 
+            text_grob("(b) Monarch survival, synergy", size=30), NULL,
+            gg.3, gg.4+ggtitle("residuals of additive model"),
+            text_grob("(c) Monarch survival, antagonism", size=30), NULL,
+            gg.5, gg.6+ggtitle("residuals of additive model"),
+            ncol=2,
+            rel_heights = c(.1, 1, .1, 1, .1, 1),
+            rel_widths = c(.85,1)
+  )
+ggsave(here("5_figs/finals/fig-5.tiff"),
+       g.fin, 
+       width = 16, height = 16, units = "in",
+       dpi = 300)
+ggsave(here("5_figs/finals/fig-5.pdf"),
+       g.fin, 
+       width = 16, height = 16, units = "in",
+       dpi = 300)
+```
+
+## Correspondence
+
+Mapping random forest to regression results to see how they line up
+
+```{r}
+
+## extracting the complete sets of results from each analysis
+fin.reg = read.xlsx(here("4_res/regression-results-exploratory.xlsx"), sheet="all analyses")
+fin.rf = read.xlsx(here("4_res/RF-results-exploratory.xlsx"), sheet="All")
+## relabeling columns to be clear about regression ("reg") versus random forest ("rf")
+fin.rf = fin.rf %>% 
+  rename(rf.relationship = relationship,
+         "rf.%PRV" = "%PRV", 
+         "rf.PRR" = "PRR")
+fin.reg = fin.reg %>% 
+  rename(reg.relationship = relationship,
+         "reg.%PRV" = "%PRV", 
+         "reg.PRR" = "PRR",
+         "reg.P" = "P"
+  )
+
+
+## cleaning up spelling issue from above - with clean run won't be needed (or cause trouble)
+## (also cleaning up trickle-down issue)
+fin.rf$data.set = gsub("clivicolis", "clivicollis", fin.rf$data.set)
+fin.rf$trait.1 = gsub("cardenolide suite$", "cardenolide suite 2016", fin.rf$trait.1)
+fin.rf$trait.2 = gsub("cardenolide suite$", "cardenolide suite 2016", fin.rf$trait.2)
+fin.reg$trait.1 = gsub("cardenolide suite$", "cardenolide suite 2016", fin.reg$trait.1)
+fin.reg$trait.2 = gsub("cardenolide suite$", "cardenolide suite 2016", fin.reg$trait.2)
+## also lat -> latex
+fin.rf$trait.1 = gsub("lat$", "latex", fin.rf$trait.1)
+fin.rf$trait.2 = gsub("lat$", "latex", fin.rf$trait.2)
+
+
+## sorting the traits between trait 1 and trait 2 in a consistent fashion so merging works.
+fin.reg[, c("trait.1", "trait.2")] = t(apply(fin.reg[, c("trait.1", "trait.2")], 1, sort))
+fin.rf[, c("trait.1", "trait.2")] = t(apply(fin.rf[, c("trait.1", "trait.2")], 1, sort))
+
+#Merge!
+fin.corr = merge(fin.reg, fin.rf, all=TRUE) %>% 
+  relocate(data.set, trait.1, trait.2, reg.relationship, rf.relationship,
+           `F.or.chi-square`, reg.P, `reg.%PRV`, `rf.%PRV`, reg.PRR, rf.PRR)
+
+
+## quick rename function to make the columns clearer
+rn_ = function(df){
+  df %>% rename("data set" = data.set,
+                "trait 1" = trait.1,
+                "trait 2" = trait.2,
+                "relationship (regression)" = reg.relationship,
+                "F or chi square" = `F.or.chi-square`,
+                "P (regression)" = reg.P,
+                "%PRV (regression)" = `reg.%PRV`,
+                "PRR (regression)" = reg.PRR,
+                "relationship (Random Forest)" = rf.relationship,
+                "%PRV (Random Forest)" = `rf.%PRV`,
+                "PRR (Random Forest)" = rf.PRR)
+}
+
+
+
+# View(fin.corr)
+
+## save to workbook
+## 
+## header format for  excel results sheets
+hs1 <- createStyle(fgFill = "#4F81BD", halign = "CENTER", textDecoration = "Bold",
+                   border = "Bottom", fontColour = "white")
+#make workbook
+wb = createWorkbook()
+
+## save all entries in a tab
+addWorksheet(wb, "all")
+writeData(wb, "all", rn_(fin.corr),
+          headerStyle = hs1)
+
+## save all entries with p<0.1 in a tab (e.g. our "regression results")
+addWorksheet(wb, "significant regressions")
+writeData(wb, "significant regressions", rn_(fin.corr[round(fin.corr$p,2)<=0.1,]),
+          headerStyle = hs1)
+
+## save all entries with clear relationship and RF %PRV >5 in a tab (e.g. our "RF results")
+## 
+addWorksheet(wb, "notable random forests")
+writeData(wb, "notable random forests", rn_(fin.corr[fin.corr$rf.relationship!="unclear" &
+                                                       fin.corr$`rf.%PRV`>=5,]),
+          headerStyle = hs1)
+
+
+## meta info
+meta.text = c("Results from testing all pairwise trait combinations for synergies or antagonisms using regression models (gam for mixed effects models) and Random Forests",
+              "`all` contains all pairwise trait combinations; `significant regressions` has filtered to p<0.1 from regression analyses; `notable random forests` has filtered for not-unclear relationships and %PRV >=5 from the random forest analyses",
+              "data set, trait 1, trait 2: designating the experiment, response, and trait pair in question", 
+              "relationship (regression), relationship (Random Forest):  type of interaction identified by regression (sign of interaction coefficient) and Random Forest (using theta and permutation testing, see main text). Random Forests can identify interactions as being meaningful even if those aren't clear synergies or antagonisms; when permutation testing didn't provide a clear designation of one or the other, the entry is listed as `unclear`.",
+              "F or chi square, P (regression):  significance testing from regression analyses (marginal hypothesis testing, p value associated with interaction term)",
+              "%PRV (regression), %PRV (Random Forest):  metric for the importance of the interaction relative to the main effects. Based on sum of squares explained by additive model, presented in percentages. See main text for details",
+              "PRR (regression), PRR (Random Forest):  metric for the importance of this trait pair on the response variable. Effectively: range of values predicted for observed plants (implementation slightly more nuanced for Random Forests). In units of response variables (so range in log mass, or range in survival)",
+              "p:  exact P value from regression; `P (regression)` above is prettified, turning values less than 0.001 to `<0.001`. We keep this column as numerics for sorting/selecting."
+)
+addWorksheet(wb, "meta data")
+writeData(wb, "meta data", meta.text)
+
+
+saveWorkbook(wb, 
+             file=here("4_res/results-correspondence.xlsx"),
+             overwrite=T
+)
+
+```
+
+
+
+
+## Supplemental figure: all random forest results
+
+```{r}
+#we'll read in our saved readfigs list, just so that we can recreate this plot without the ~30 min compile time for lines above.
+readyfig.ls = readRDS(here("5_figs/rf biplots/readyfigs-list-all.RDS"))
+
+labels.vec = apply(expand.grid(letters, c("", letters))[,c(2,1)], 1, paste0, collapse="")
+labels.vec = paste0("(", labels.vec, ")")
+
+pdf(here("5_figs/finals/supp-rf-all.pdf"), width= 12, height=14, onefile=T)
+figcount = 1
+while(figcount <= length(readyfig.ls)){
+  gp = plot_grid(plotlist = readyfig.ls[figcount:min(figcount+2,
+                                                     length(readyfig.ls))],
+                 ncol=1,
+                 labels = labels.vec[figcount:min(figcount+2,
+                                                  length(readyfig.ls))],
+                 label_size = 18)
+  print(gp)
+  figcount = figcount+3
+}
+dev.off()
+
+
+plot_grid(plotlist = readyfig.ls[figcount:min(figcount+2,
+                                              length(readyfig.ls))],
+          ncol=1, labels = letters[1:3])
+```
+
