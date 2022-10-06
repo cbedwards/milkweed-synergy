@@ -1,4 +1,4 @@
-Directory for data and analysis of "Plant defense synergies and antagonisms affect performance of specialist herbivores of common milkweed." 
+Directory for data and analysis of "Plant defense synergies and antagonisms affect performance of specialist herbivores of common milkweed," by Edwards, Ellner, and Agrawal. Publication accepted to Ecology 27 September, 2022; preprint is available here: https://doi.org/10.1101/2021.09.13.460116/. In this publication, we use existing statistical tools and novel adaptations of Random Forest analysis to identify synergies and antagonisms in the defense traits of the common milkweed plant.
 
 See the associated publication for an overview of the data and methods. Here we provide data on common milkweed defense traits and the performance of two herbivores (monarch butterfly larvae and swamp milkweed beetle larvae) on those plants. The code and results used to carry out analysis and plotting for the associated publication, as well as a detailed tutorial for implementing the novel statistical approach we present in our publication.
 
